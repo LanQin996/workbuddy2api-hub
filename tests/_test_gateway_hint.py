@@ -7,11 +7,19 @@ guess. Run with the bundled Python:
 
     python tests/_test_gateway_hint.py
 """
+import io
+import json
 import os
 import sys
+import types
 import unittest
+import urllib.error
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _isolated_dirs import isolated_data_dirs
+
+_TMP = isolated_data_dirs("wb-context-errors-")
 
 import wb_proxy as proxy
 
@@ -52,10 +60,25 @@ class HintClassificationTests(unittest.TestCase):
 
 class _Stub(object):
     _error = proxy.Handler._error
+    _handle_responses = proxy.Handler._handle_responses
+    _dispatch_chat_post = proxy.Handler._dispatch_chat_post
 
     def __init__(self):
         self.status = None
         self.payload = None
+        self.headers = {}
+
+    def _request_realm(self):
+        return "intl"
+
+    def _cross_realm_error(self, *_):
+        return ""
+
+    _banned_model_error = _cross_realm_error
+    _key_model_error = _cross_realm_error
+
+    def _key_id(self):
+        return None
 
     def _handle_expect_continue(self):
         pass
@@ -87,6 +110,104 @@ class ErrorEnvelopeTests(unittest.TestCase):
         error = stub.payload["error"]
         self.assertNotIn("gateway_hint", error)
         self.assertEqual("internal error", error["message"])
+
+    def test_semantic_code_does_not_change_http_status_or_message(self):
+        stub = _Stub()
+        stub._error(400, "original", "invalid_request_error",
+                    error_code="context_length_exceeded")
+        self.assertEqual(400, stub.status)
+        self.assertEqual({"message": "original", "type": "invalid_request_error",
+                          "code": "context_length_exceeded"}, stub.payload["error"])
+
+
+class ContextErrorTests(unittest.TestCase):
+    def reply(self, route, body, status=400, enabled="1", stream=True):
+        stub = _Stub()
+        failure = urllib.error.HTTPError("https://up", status, "Bad Request", {},
+                                         io.BytesIO(body))
+        payload = {"model": "deepseek-v4.1-flash", "stream": stream,
+                   "input": "hello", "messages": [{"role": "user", "content": "hello"}]}
+        with mock.patch.dict(os.environ, {"WB_CONTEXT_ERROR_NORMALIZE": enabled}), \
+                mock.patch.object(proxy, "open_upstream", side_effect=failure) as upstream, \
+                mock.patch.object(proxy, "record_error") as recorded, \
+                mock.patch.object(proxy, "log"), \
+                mock.patch.object(proxy, "BLOCK_BACKGROUND_REQUESTS", False):
+            stub._dispatch_chat_post(route, payload)
+        failure.close()
+        self.assertEqual(1, upstream.call_count)
+        self.assertEqual(body[:600].decode("utf-8", "replace"), recorded.call_args[0][2])
+        self.assertEqual("upstream %d: %s" % (status, body[:600].decode("utf-8", "replace")),
+                         stub.payload["error"]["message"])
+        return stub
+
+    def test_routes_normalize_the_observed_error_only_when_enabled(self):
+        body = b'{"code":11115,"msg":"input exceeds limit"}'
+        for route in ("/v1/responses", "/v1/chat/completions"):
+            for stream in (True, False):
+                for enabled in ("", "0", "1"):
+                    with self.subTest(route=route, stream=stream, enabled=enabled):
+                        stub = self.reply(route, body, enabled=enabled, stream=stream)
+                        self.assertEqual(400, stub.status)
+                        self.assertEqual("context_length_exceeded" if enabled == "1" else 400,
+                                         stub.payload["error"]["code"])
+                        self.assertEqual("invalid_request_error" if enabled == "1" else "server_error",
+                                         stub.payload["error"]["type"])
+
+    def test_structural_lookalikes_and_non_400_stay_unchanged(self):
+        bodies = [b'{"msg":"11115"}', b'{"code":111150}', b'{"code":11115.9}',
+                  b'{"code":true}', b'{"error":{"code":11115}}', b'11115',
+                  b'not JSON 11115', b'{"code":11115', b'{"code":400}']
+        for route in ("/v1/responses", "/v1/chat/completions"):
+            for body in bodies:
+                with self.subTest(route=route, body=body):
+                    stub = self.reply(route, body)
+                    self.assertEqual(400, stub.payload["error"]["code"])
+                    self.assertEqual("server_error", stub.payload["error"]["type"])
+            stub = self.reply(route, b'{"code":11115}', status=500)
+            self.assertEqual(500, stub.status)
+            self.assertEqual(500, stub.payload["error"]["code"])
+
+    def test_larger_body_is_inspected_without_expanding_display(self):
+        body = json.dumps({"msg": "x" * 700, "code": "11115"}).encode()
+        for route in ("/v1/responses", "/v1/chat/completions"):
+            stub = self.reply(route, body)
+            self.assertEqual("context_length_exceeded", stub.payload["error"]["code"])
+            oversized = b'{"code":11115,"msg":"' + b'x' * 9000 + b'"}'
+            stub = self.reply(route, oversized)
+            self.assertEqual(400, stub.payload["error"]["code"])
+
+    def test_hint_requires_the_structured_code(self):
+        with mock.patch.dict(os.environ, {"WB_CONTEXT_ERROR_NORMALIZE": "1"}):
+            for body in ('{"code":11115}', 'upstream 400: {"code":"11115"}'):
+                self.assertIn("context", proxy.gateway_hint(400, body))
+            for body in ('{"msg":"11115"}', '11115', '{"code":111150}',
+                         '{"code":11115.9}', '{"error":{"code":11115}}'):
+                self.assertEqual("", proxy.gateway_hint(400, body))
+            self.assertEqual("", proxy.gateway_hint(500, '{"code":11115}'))
+
+    def test_context_400_does_not_retry_or_penalize_the_account(self):
+        account = proxy.wb_accounts.Account({"uid": "synthetic-context-account",
+                                            "accessToken": "x.y.z", "enabled": True,
+                                            "realm": "intl"})
+        pool = types.SimpleNamespace(
+            accounts=[account], count_ready=lambda *a, **kw: 1,
+            apply_remaining_weights=lambda *a: None,
+            pick_for_session=lambda *a, **kw: account,
+            affinity=types.SimpleNamespace(demote=mock.Mock()))
+        failure = urllib.error.HTTPError("https://up", 400, "Bad Request", {},
+                                         io.BytesIO(b'{"code":11115,"msg":"too long"}'))
+        with mock.patch.object(proxy, "POOL", pool), \
+                mock.patch.object(proxy, "apply_daily_guards"), \
+                mock.patch.object(proxy.wb_accounts, "urlopen", side_effect=failure) as upstream:
+            with self.assertRaises(urllib.error.HTTPError):
+                proxy.open_upstream({"model": "deepseek-v4.1-flash", "messages": [
+                    {"role": "user", "content": "hello"}]}, target_realm="intl")
+        failure.close()
+        self.assertEqual(1, upstream.call_count)
+        self.assertEqual(0, account.fails)
+        self.assertEqual(0, account.degrade_count)
+        self.assertEqual(0, account.throttle_wait())
+        pool.affinity.demote.assert_not_called()
 
 
 if __name__ == "__main__":

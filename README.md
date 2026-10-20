@@ -453,6 +453,12 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **全局对话并发支持不限模式**：设置 `WB_MAX_CONCURRENT_CHAT=0` 后，Chat / Responses / Messages 不再等待全局并发名额或返回该门禁的 503。默认值仍为 32，正整数及 `auto` 模式保持兼容；API Key 的独立并发设置仍单独生效。
+
+- **上下文超限错误支持客户端恢复**：新增 `WB_CONTEXT_ERROR_NORMALIZE=1`（默认关闭）。开启后，Chat / Responses 对上游 HTTP 400、JSON 顶层 `code=11115` 返回标准 `invalid_request_error` / `context_length_exceeded`，保留原始错误消息，方便支持该错误码的客户端压缩历史；网关不自动裁剪消息。
+
+- **降低 Responses 流式转发开销**：`/v1/responses` 复用 SSE 分块读取，在下一次阻塞读取前合并写出当前块的事件，并跳过普通文本帧不必要的工具字段清洗；每条流复用 JSON 编解码器，固定结构的文本与推理增量帧走等价快速编码。字符串转义仍用标准库，其余结构回退通用编码，保留首帧即时发送、工具多轮边界、异常尾帧及原有输出内容。
+
 - Docker 镜像工作流新增 `main` 分支推送触发，自动构建并推送 `main` 与 `latest` 标签；稳定 Release 的版本标签与 `latest` 发布行为保持不变。
 
 - 账号导入支持一次选择多个 JSON 文件；所有文件会合并预检并一次提交，跨文件重复 UID 统一按覆盖选项处理。

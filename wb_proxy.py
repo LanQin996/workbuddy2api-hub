@@ -46,11 +46,14 @@ MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 16 * 1024 * 1024)
 # accounts the pool holds: a 200-account gateway and a 5-account gateway share
 # it. Set WB_MAX_CONCURRENT_CHAT=auto to size it from the pool instead - one
 # slot per ready account, never below 32. See resize_chat_slots().
+# Set WB_MAX_CONCURRENT_CHAT=0 to disable only this global ceiling.
 _CHAT_SLOTS_ENV = os.environ.get("WB_MAX_CONCURRENT_CHAT", "32").strip().lower()
 CHAT_SLOTS_AUTO = _CHAT_SLOTS_ENV in ("auto", "pool", "dynamic")
 CHAT_SLOTS_FLOOR = 32
 try:
     MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR if CHAT_SLOTS_AUTO else int(_CHAT_SLOTS_ENV)
+    if MAX_CONCURRENT_CHAT < 0:
+        MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 except ValueError:
     MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 CHAT_SLOT_WAIT_SECONDS = float(os.environ.get("WB_CHAT_SLOT_WAIT", 30))
@@ -11430,6 +11433,11 @@ def clean_responses_frame(frame):
     """
     if not frame:
         return frame
+    # Ordinary delta frames have neither field. Keep escaped JSON keys on the
+    # parsing path too (e.g. function\u005fcall), preserving the cleanup rules.
+    if (isinstance(frame, bytes) and b"function_call" not in frame
+            and b"tool_calls" not in frame and b"\\" not in frame):
+        return frame
     try:
         text = frame.decode("utf-8")
     except Exception:
@@ -13092,6 +13100,35 @@ class RateLimited(Exception):
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+def context_error_normalize_enabled():
+    """Opt in to the client-readable context-limit error code."""
+    return os.environ.get("WB_CONTEXT_ERROR_NORMALIZE", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def upstream_context_length_error(status, detail):
+    """Only the observed HTTP 400 / top-level 11115 body is a context error."""
+    if status != 400:
+        return False
+    try:
+        payload = json.loads(detail)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    code = payload.get("code")
+    return (type(code) is int and code == 11115) or code == "11115"
+
+
+def upstream_error_response_detail(exc):
+    """Inspect a bounded body when opted in; preserve the old displayed bytes."""
+    normalize = context_error_normalize_enabled() and exc.code == 400
+    raw = read_http_error(exc, 8193 if normalize else 600)
+    context_error = (normalize and len(raw) <= 8192
+                     and upstream_context_length_error(exc.code, raw))
+    return raw[:600].decode("utf-8", "replace"), context_error
+
+
 def gateway_hint(status, message):
     """A gateway-side note that sits beside the raw upstream message.
 
@@ -13108,6 +13145,11 @@ def gateway_hint(status, message):
     """
     text = str(message or "")
     lower = text.lower()
+    detail = text[len("upstream 400: "):] if text.startswith("upstream 400: ") else text
+    if (context_error_normalize_enabled()
+            and upstream_context_length_error(status, detail)):
+        return ("request context exceeds the model's limit; reduce "
+                "history/message size")
     if status == 413 and "payload too large" in lower:
         return ("single request body exceeds the gateway cap "
                 "(WB_MAX_PAYLOAD_BYTES, default 16MB); raise it and restart wb-proxy")
@@ -16487,8 +16529,12 @@ def reasoning_only_response(result):
             and obj.get("status") != "incomplete")
 
 
-def stream_responses_events(upstream, model, holder):
+def stream_responses_events(upstream, model, holder, before_read=None):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
+    # Reuse one encoder per stream instead of allocating one for every event.
+    encode_json = json.JSONEncoder(ensure_ascii=False).encode
+    # SSE data is already text; bypass json.loads' input-type dispatch.
+    decode_json = json.JSONDecoder().decode
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
     seq = 0
@@ -16532,12 +16578,38 @@ def stream_responses_events(upstream, model, holder):
         if ns_map:
             obj["output"], _nsf = apply_namespace_to_calls(obj.get("output") or [], ns_map)
         return obj
+    # Only these two flat delta shapes use the shortcut below. Prefixes contain
+    # request-independent event metadata; no streamed text is cached here.
+    delta_shapes = {}
+    for event_type, index_key in (
+            ("response.output_text.delta", "content_index"),
+            ("response.reasoning_summary_text.delta", "summary_index")):
+        delta_shapes[event_type] = (
+            index_key, ("item_id", "output_index", index_key, "delta"),
+            "event: " + event_type + '\ndata: {"type": ' + encode_json(event_type)
+            + ', "sequence_number": ')
+
     def ev(etype, payload):
         nonlocal seq
         seq += 1
+        shape = delta_shapes.get(etype)
+        if (shape is not None and type(payload) is dict
+                and tuple(payload) == shape[1]
+                and isinstance(payload["item_id"], str)
+                and isinstance(payload["delta"], str)
+                and type(payload["output_index"]) is int
+                and type(payload[shape[0]]) is int):
+            # Preserve JSONEncoder's escaping and default spacing/key order.
+            # Unusual fields, ordering, or types retain the generic encoder.
+            return (shape[2] + str(seq)
+                    + ', "item_id": ' + encode_json(payload["item_id"])
+                    + ', "output_index": ' + str(payload["output_index"])
+                    + ', "' + shape[0] + '": ' + str(payload[shape[0]])
+                    + ', "delta": ' + encode_json(payload["delta"])
+                    + '}\n\n').encode("utf-8")
         data = {"type": etype, "sequence_number": seq}
         data.update(payload)
-        body = json.dumps(data, ensure_ascii=False)
+        body = encode_json(data)
         return ("event: " + etype + chr(10) + "data: " + body + chr(10) + chr(10)).encode("utf-8")
     def reason_item(status):
         return {
@@ -16795,14 +16867,14 @@ def stream_responses_events(upstream, model, holder):
     if not holder.get("suppress_lifecycle"):
         yield ev("response.created", {"response": resp_obj("in_progress")})
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
-    for raw in upstream:
+    for raw in iter_sse_lines(upstream, before_read=before_read):
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             if data == "[DONE]":
                 saw_done = True
             continue
         try:
-            chunk = json.loads(data)
+            chunk = decode_json(data)
         except Exception:
             continue
         u = chunk.get("usage")
@@ -17401,14 +17473,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except Exception:
             pass
-    def _error(self, code, message, err_type="server_error"):
+    def _error(self, code, message, err_type="server_error", error_code=None):
         # Every early rejection funnels through here, so draining the body in
         # one place covers all of them. Unblock any client still waiting on
         # "Expect: 100-continue" first, otherwise it never sends the body and
         # the drain below waits for data that will never arrive.
         self._handle_expect_continue()
         self._discard_body()
-        error = {"message": message, "type": err_type, "code": code}
+        error = {"message": message, "type": err_type,
+                 "code": code if error_code is None else error_code}
         hint = gateway_hint(code, message)
         if hint:
             error["gateway_hint"] = hint
@@ -20323,11 +20396,15 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
-            detail = read_http_error(exc, 600).decode("utf-8", "replace")
+            detail, context_error = upstream_error_response_detail(exc)
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
+            if context_error:
+                return self._error(400, f"upstream 400: {detail}",
+                                   "invalid_request_error",
+                                   error_code="context_length_exceeded")
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
@@ -20366,6 +20443,16 @@ class Handler(BaseHTTPRequestHandler):
                   "session_key": session_key,
                   "realm": realm}
         first_ms = None
+        # Drain the frames from one read1 block before the next blocking read.
+        # This also sends the opening lifecycle before waiting for upstream.
+        out_buf = []
+
+        def flush_out():
+            if out_buf:
+                self.wfile.write(b"".join(out_buf))
+                self.wfile.flush()
+                del out_buf[:]
+
         try:
             # 一轮跑完如果模型要的是 web_search / web_fetch，就由反代
             # 执行、把结果喂回去再跑一轮。客户端从头到尾只看到一则连续的回应。
@@ -20375,11 +20462,19 @@ class Handler(BaseHTTPRequestHandler):
                 holder.pop("internal_calls", None)
                 holder.pop("suppress_completion", None)
                 holder["suppress_lifecycle"] = rounds > 0
-                for frame in stream_responses_events(upstream, model, holder):
+                batch_reads = getattr(upstream, "read1", None) is not None
+                for frame in stream_responses_events(
+                        upstream, model, holder, before_read=flush_out):
                     if first_ms is None:
                         first_ms = int((time.time() - t_start) * 1000)
-                    self.wfile.write(clean_responses_frame(frame))
-                    self.wfile.flush()
+                    out_buf.append(clean_responses_frame(frame))
+                    if not batch_reads:
+                        # Plain iterables can block before iter_sse_lines gets
+                        # to its hook. Preserve immediate writes for that case.
+                        flush_out()
+                # Finalization runs after the last read, including EOF without
+                # DONE. Flush it before a possible web-tool follow-up round.
+                flush_out()
                 # 每一轮的 token 都是真的花掉的，记帐要加总
                 total_usage = sum_usage(total_usage, holder.get("usage"))
                 internal = holder.get("internal_calls") or []
@@ -20413,6 +20508,7 @@ class Handler(BaseHTTPRequestHandler):
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, outcome="upstream_aborted", key=self._key_id())
             try:
+                flush_out()
                 self.wfile.write(b"data: [DONE]" + bytes([10, 10]))
                 self.wfile.flush()
             except Exception:
@@ -20821,10 +20917,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(429, message, "rate_limit_error")
 
         try:
+            # Keep the exact semaphore acquired for this request: auto sizing
+            # may replace the global object while a request is still running.
+            slots = _chat_slots if MAX_CONCURRENT_CHAT > 0 else None
             if is_messages_route:
                 if path.endswith("/count_tokens"):
                     return self._handle_messages_count_tokens(payload)
-                if not _chat_slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
+                if slots is not None and not slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
                     message = ("gateway is at its concurrent chat limit "
                                "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
                     record_error(payload.get("model") or "unknown", 503, message,
@@ -20833,17 +20932,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     return self._handle_messages(payload)
                 finally:
-                    _chat_slots.release()
+                    if slots is not None:
+                        slots.release()
             # Both OpenAI-shaped routes below can hold a thread for up to 600s.
             # Take a slot for the duration; release it in finally so every early
             # return (including client disconnects) gives the slot back.
-            if not _chat_slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
+            if slots is not None and not slots.acquire(timeout=CHAT_SLOT_WAIT_SECONDS):
                 return self._error(503, "gateway is at its concurrent chat limit "
                                         "(%d in flight); retry shortly" % MAX_CONCURRENT_CHAT)
             try:
                 return self._dispatch_chat_post(path, payload)
             finally:
-                _chat_slots.release()
+                if slots is not None:
+                    slots.release()
         finally:
             _release_key_slot(self.key_entry)
 
@@ -20929,11 +21030,15 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._rate_limited(exc)
         except urllib.error.HTTPError as exc:
-            detail = read_http_error(exc, 600).decode("utf-8", "replace")
+            detail, context_error = upstream_error_response_detail(exc)
             record_error(model, exc.code, detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
+            if context_error:
+                return self._error(400, f"upstream 400: {detail}",
+                                   "invalid_request_error",
+                                   error_code="context_length_exceeded")
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
