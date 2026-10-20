@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.16-2496ED?style=flat-square" alt="Version 1.7.16"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.17-2496ED?style=flat-square" alt="Version 1.7.17"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -145,7 +145,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 182 个套件：135 个 Python + 47 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 188 个套件：139 个 Python + 49 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -210,6 +210,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - **定价来源**：OpenRouter 模型目录的**模型级公布价**。OpenRouter 把它定义为该模型 top provider 的价——对多 provider 模型通常就是最低档（实测 `deepseek-v4.1-flash` 的模型级价只比 34 家 provider 的最低价高 5%）。这组数字只用于「这些 token 放在 OpenRouter 上值多少钱」的参考估算，**不等于 WorkBuddy 官方价，也不能用于结算**。每份价格按内容存成一条「定价策略」，每条请求只记引用了哪条策略，所以之后调价不会改写历史数字；`wb_pricing.py` 另内嵌一份快照作出厂价。
 - **刷新**：「设置 → 定价刷新」默认每 5 分钟一次（填 0 关闭）；只有价格真的变了才写策略与时间轴，价格不动时每轮只是一次 HTTP GET。面板可看当前生效策略、上次 / 下次取价时间与失败原因，也能点「立即取价」。
 - **新增模型自动取价**：候选清单 = 内置目录 ∪ 网关实时目录，上游新上架的名字 5 分钟内进入取价；两次取价之间就被调用也会按需补价（请求路径不发网络请求）。匹配顺序：面板手填覆盖 → 人工覆盖表 → 同名唯一命中 → 变体后缀继承（剥 `-lkeap` / `-taiji` / `-volc` / `-sg` 等，仍要求唯一命中），继承可在设置里整体关掉。
+- **按模型校准**：在 `usage/pricing-markup.json` 写 `{"deepseek-v4.1-flash": 5.36}` 之类的系数，估算金额会乘以它；文件缺失或值非法时按 1.0。它只影响读时估算，不改写历史策略。
 - **未定价可见**：`/pricing` 列出未定价模型及分类（别名 / OpenRouter 无对应 / 剥后缀后无唯一基准）与相似候选（仅建议，不自动采用），可在「设置 → 定价刷新」为某条手填 OpenRouter id 并登记（写 `pricing-overrides.json`，不改源码，登记后立即取价）。
 - **展示位置**：数据看板「API 等价花费」卡片、各账号用量透视与模型性能表**最后一列**、网关页「估算价格」卡片、最近请求**最后一列**（悬停可看完整定价链：三档原始单价、汇率、匹配证据、策略 id 与补算标记 `*`）。
 - **人民币 / 美元**一键切换（记在浏览器本地）；快照覆盖不到的模型显示 `—`，不猜数字。
@@ -453,6 +454,18 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **模型清单标出「免费账号不可用」**（#505，运行时部分）：上游返回 `11158`（model not allowed for user type）时写入 `accounts/model_entitlements.json`，同一 `(realm, model)` 后续成功请求自动撤标；`11102` / `11134` 不记。`/v1/models` 每条带 `entitlement` 字段，面板在倍率旁显示「免费账号不可用」胶囊，hover 给出 code / userType / 检测时刻，24 小时后自动过期。刷新清单时的主动探测尚未接（需要采样口径）。
+
+- **OpenRouter 估价可按模型校准**（#514）：`usage/pricing-markup.json` 支持 `{模型: 系数}`，估算金额乘以该系数，便于把 OR 的 top-provider 参考价校准到官方价；文件缺失、损坏或非正数按 1.0，策略历史不改写。新增 5 项测试。
+
+- **成长任务支持手动领取**（#507）：任务区新增「自动领取」复选框（默认开）。取消后「一键做任务」只推进进度，任务停在「待领奖」，在任务表里按账号逐个点「领取」；新增 `POST /tasks/claim`。这样可以把积分分散到不同时间领取，避免同一分钟集中过期。
+
+- **面板改密结果以服务端为准**（#523）：`/panel/password` 现在返回 `using_default_password`，设置页不再按输入框内容猜「已自定义」；改密成功会在日志里写一行 `panel : password changed`，便于确认改的是不是当前实例。改密的存储/校验补了 5 项单测（默认密码、覆盖、盐变化、改回 admin）。
+
+- **流式断流：首字节前自动重试一次，出口退避按「读完」记账**（#522）：`open_upstream` 拿到响应头就返回，`IncompleteRead` 发生在 `_chat_stream_response` 读 body 时，回不到重试循环；chat 路径还补一个 `[DONE]` 当作正常结束。现在 `emitted=False`（客户端一个字节都没收到）时在同一账号、同一出口上重开一次，递归复用已经发出的响应头；`iter_sse_lines` 对 Content-Length 提前 EOF 补抛 `IncompleteRead`。出口维度的成功记账从「拿到响应头」挪到「流读完」：读流断掉记 transient，重试成功不抵消这次信号，干净的流才清零。`emitted=True` 的截断仍按原样收尾（可选 error 帧留待后续）。
+
+- **修复把日限额改回 0 不生效**：`apply_daily_guards()` 此前只对「至少一个作用域 > 0」的护栏推送新值，而账号对象上的 `daily_token_limit` / `daily_credit_limit` / `model_daily_token_limit` 只存在于内存（`Account.__init__` 归零、不落盘）。于是「关掉限额」恰好成了唯一推不出去的那次编辑：号上还留着上一次的非零值，面板显示旧限额、账号一直 `dailyLimitBlocked`，直到进程重启才恢复。现在**设置保存路径**（`refresh=True`）会把三条护栏都推一次（值为 0 也推），把旧值覆盖回落；请求热路径仍维持「没配限额就完全不碰池子」的原有契约，不为此多付开销。计数仍只在至少一条护栏开着时才折叠，`stats is None` 时池侧保留上次计数，所以「没配限额 -> 计数未知 -> 永不 park」以及关闭限额的行为都与从前一致。新增 `tests/_test_daily_token_limit.py` 的 `GuardClearTests`（2 例）——走 `apply_daily_guards()` 而非直接调 pool，复现并钉住这条路径。 / Fix turning a daily limit back to 0 having no effect: `apply_daily_guards()` only published a guard when at least one scope was above 0, while the per-account limit fields live in memory only (set to 0 in `Account.__init__`, never persisted). "Turn the limit off" was therefore the one edit that never reached the pool - the accounts kept the last non-zero value and stayed parked until the process restarted. The settings-save path (`refresh=True`) now publishes all three guards even when every value is 0, overwriting the stale ones, while the request hot path keeps its "no limit configured -> do not touch the pool" contract and pays nothing extra. Counters are still folded only when at least one guard is on (`stats is None` keeps the last known counts), leaving the "no limit -> unknown count -> never park" rule untouched. `GuardClearTests` (2 cases) in `tests/_test_daily_token_limit.py` calls `apply_daily_guards()` itself (not the pool directly) to pin it.
+
 - **扁平长上下文的会话亲和回退（默认关闭）**：未提供显式会话标识，且消息恰为 `system` + 单条字符串 `user` 时，可设置 `WB_AFFINITY_FLAT_USER_PREFIX_CHARS=8192`，让持续增长的长 user 内容按固定前缀派生亲和键；内容不超过阈值时仍使用旧键，`0`、负数或无效配置关闭回退。显式会话键及其他消息结构不变，不按 `user_id` 合并会话。
 
 - **修复「一键刷新积分」必定失败（NameError → 502）**：`_credits_sweep` 的账号间拟人间隔写了 `random.uniform(...)`，但 `wb_proxy.py` 从来没有 `import random`。零间隔或单值间隔会被 `lo if hi <= lo` 短路掉，**只有默认的 800~1200ms 区间**才会真的走到那一行——所以任何人点「一键刷新积分」（或账号页自动补快照）都必定 `NameError`：异常从 `do_POST` 抛穿处理线程，网关不发响应直接断连，前面挂反代时浏览器看到的正是「刷新积分失败: 502」。补上 `import random`。原有用例把间隔改成 120ms 单值，恰好绕开了随机分支；`tests/_test_credits_sweep_guard.py` 增两例强制走区间分支并显式钉住模块级 import（现 19 例）。
@@ -500,7 +513,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **DSH 一键配置放宽限流重试，修掉「对话到一半链接中断」**：WorkBuddy 的 429 冷却通常约一分钟，而 DSH 的默认 `retryPolicy` 是 `normal` / 最多 5 次 / 退避 500ms 起翻倍、封顶 10s——加起来不到 16 秒就放弃，冷却还没结束回合就以 `RATE_LIMIT` 失败。一键配置现在给 `wb-proxy` 单独写 `retryPolicy: {mode: normal, maxRetries: 8, backoff: {initialDelayMs: 2000, maxDelayMs: 30000, jitterRatio: 0.1}}`（合计约 2 分半），只影响 `wb-proxy`，其它 provider 仍用默认策略；字段与取值按 `@deepseek-ai/dsh-llm` 的 `RetryPolicySchema`。已经接入过的机器重新点一次「一键配置」即可补上这段（幂等），重启 DSH 生效。
   DSH's default per-provider retry policy (normal, at most 5 retries, 500ms→10s backoff, under 16 seconds in total) gives up before WorkBuddy's ~60s rate-limit cooldown ends, so the turn dies with `RATE_LIMIT` — which the user sees as the conversation breaking mid-flight. The one-click config now writes a wider `retryPolicy` for `wb-proxy` only (8 retries, 2s initial delay, 30s cap, ~2.5 minutes in total); other providers keep the default policy. Field names and bounds follow `@deepseek-ai/dsh-llm`'s `RetryPolicySchema`. Re-running the one-click config on an already-integrated machine adds it idempotently, and a DSH restart applies it.
 
-已发布版本的完整记录（v1.4.5 ~ v1.7.16，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.7.17，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 

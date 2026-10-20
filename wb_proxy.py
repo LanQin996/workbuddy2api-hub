@@ -20,6 +20,7 @@ import calendar
 import errno
 import hashlib
 import heapq
+import http.client
 import io
 import ipaddress
 from collections import deque
@@ -70,6 +71,7 @@ import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_egress
+import wb_entitlements
 import wb_ipintel
 import wb_logstore
 import wb_pricing
@@ -2007,19 +2009,33 @@ def apply_daily_guards(refresh=False):
     stats = daily_usage_stats(ttl=ttl) if wants else None
     # 池上这三个 apply_* 的返回值是它们各自的 limits 字典（不是计数），调用方
     # 谁也没用过；这里数的是「推了几条护栏」，别拿返回值做算术。
+    #
+    # 关掉某条护栏（改回 0）同样要推一次。账号上的 daily_*_limit 只活在内存里
+    # （__init__ 归零、不落盘），不推就等于没关：账号一直保留上一次的非零值，
+    # 面板显示旧限额、`dailyLimitBlocked` 恒为真，直到进程重启才恢复。
+    # 设置保存走 refresh=True，此时三条都无条件推一次，把旧值覆盖回落；请求
+    # 热路径仍维持「没配限额就完全不碰池子」的原有契约，不为此多付开销。
+    # 计数仍只在至少一条护栏开着时才折叠（stats 为 None 时传 None，池侧保留
+    # 上次的计数），所以「没配限额 -> 计数未知 -> 永不 park」的语义不变。
     published = 0
-    if any(v > 0 for v in token_limits.values()):
+    token_on = any(v > 0 for v in token_limits.values())
+    if token_on or refresh:
         POOL.apply_daily_token_limit(
             token_limits, stats["tokens"] if stats is not None else None)
+    if token_on:
         published += 1
-    if any(v > 0 for v in credit_limits.values()):
+    credit_on = any(v > 0 for v in credit_limits.values())
+    if credit_on or refresh:
         POOL.apply_daily_credit_limit(
             credit_limits, stats["credits"] if stats is not None else None,
-            free_models_by_realm())
+            free_models_by_realm() if credit_on else None)
+    if credit_on:
         published += 1
-    if any(v > 0 for v in model_limits.values()):
+    model_on = any(v > 0 for v in model_limits.values())
+    if model_on or refresh:
         POOL.apply_model_daily_token_limit(
             model_limits, stats["models"] if stats is not None else None)
+    if model_on:
         published += 1
     return published
 
@@ -10143,7 +10159,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.16",
+        "version": "1.7.17",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -13889,7 +13905,8 @@ def _free_model_credit_fallback_enabled():
 
 
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
-                  allow_credit_fallback=True, allow_product_switch=True):
+                  allow_credit_fallback=True, allow_product_switch=True,
+                  pin_account=None, defer_egress_success=False):
     # Refresh the daily guards before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by any of the guards is skipped
@@ -13906,7 +13923,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
-    pinned = pinned_account()
+    pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
         if pinned.realm != realm:
             raise PinnedAccountError(
@@ -14105,9 +14122,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                        proxy=account.proxy)
             _apply_stream_idle_timeout(resp, idle_timeout)
             account.note_success(model=model)
-            if egress_backoff:
+            wb_entitlements.clear(ACCOUNTS_DIR, account.realm, model)
+            if egress_backoff and not defer_egress_success:
                 # This outbound path just served a request, so its transient
                 # streak is over (same rule as the account's note_success).
+                # Callers that read the body afterwards defer this to the end
+                # of the read: a stream that dies mid-body is not a success.
                 wb_egress.note_success(
                     wb_upstream_pool.egress_key(chat_url, account.proxy))
             reset_switch_counter(account, model)
@@ -14275,9 +14295,23 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                    single_account=(total <= 1))
                 last_error = exc
                 continue
+            if exc.code == 400:
+                detail = http_error_detail(exc)
+                code = upstream_error_code(detail)
+                if code == 11158:
+                    wb_entitlements.mark(
+                        ACCOUNTS_DIR, account.realm, model, code,
+                        user_type=wb_entitlements.user_type_from_detail(detail))
+                    log("model '%s' is not allowed for %s free tier (11158); marked"
+                        % (model, account.realm))
+                raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
                 code = upstream_error_code(detail)
+                if code == 11158:
+                    wb_entitlements.mark(
+                        ACCOUNTS_DIR, account.realm, model, code,
+                        user_type=wb_entitlements.user_type_from_detail(detail))
                 if (code in MODEL_SCOPED_ERROR_CODES
                         and not model_scoped_errors_penalize_account()):
                     # A bad model name must not take the whole pool down. The
@@ -14698,6 +14732,13 @@ def iter_sse_lines(source, block_size=SSE_READ_BLOCK, before_read=None):
             before_read()
         chunk = read1(block_size)
         if not chunk:
+            # http.client.read1() returns b"" when the peer closes early and
+            # does not raise for a Content-Length response; without this check
+            # a truncated stream looks like a clean EOF and the retry path in
+            # _chat_stream_response never sees it (issue #522).
+            remaining = getattr(source, "length", 0) or 0
+            if remaining > 0:
+                raise http.client.IncompleteRead(b"", remaining)
             break
         buf += chunk
         if b"\n" not in buf:
@@ -17281,7 +17322,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.16"
+    server_version = "wb-proxy/1.7.17"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -18022,6 +18063,11 @@ class Handler(BaseHTTPRequestHandler):
         if wb_settings.filter_models_by_key(ACCOUNTS_DIR) and self.key_entry:
             data = [m for m in data
                     if wb_settings.key_allows_model(self.key_entry, m.get("id"))]
+        marks = wb_entitlements.snapshot(ACCOUNTS_DIR, req_realm or CURRENT_REALM)
+        for m in data:
+            ent = (marks.get(req_realm or CURRENT_REALM) or {}).get(m.get("id"))
+            if ent:
+                m["entitlement"] = ent
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
@@ -19551,11 +19597,16 @@ class Handler(BaseHTTPRequestHandler):
             if len(new) < 4:
                 return self._error(400, "new password must be at least 4 characters", "invalid_request_error")
             wb_settings.set_panel_password(ACCOUNTS_DIR, new)
+            log("panel      : password changed")
             if new != wb_settings.DEFAULT_PANEL_PASSWORD:
                 # Rotating the password invalidates every other browser session.
                 PANEL.revoke_all()
             token = PANEL.create()
-            return self._json(200, {"ok": True, "token": token})
+            return self._json(200, {
+                "ok": True, "token": token,
+                "using_default_password":
+                    new == wb_settings.DEFAULT_PANEL_PASSWORD,
+            })
         return self._error(404, "not found", "invalid_request_error")
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
@@ -19573,6 +19624,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_account_credits_detail(payload)
         if path == "/tasks/run":
             return self._route_tasks_run(payload)
+        if path == "/tasks/claim":
+            return self._route_tasks_claim(payload)
         if path == "/tasks/travel":
             return self._route_tasks_travel(payload)
         if path == "/tasks/streak-bonus":
@@ -19733,13 +19786,14 @@ class Handler(BaseHTTPRequestHandler):
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到已启用的国内版账号"})
         from wb_tasks import run_growth_tasks
+        claim = payload.get("claim", True) is not False
         combined_logs = []
         total_credit = 0
         for i, acc in enumerate(targets):
             uid_str = acc.uid[:8] if acc.uid else "?"
             nick = acc.nickname or uid_str
             combined_logs.append(f"====== 正在为账号 [{nick} ({acc.uid})] 执行全自动成长任务 ({i+1}/{len(targets)}) ======")
-            res = run_growth_tasks(acc, gap=1.0)
+            res = run_growth_tasks(acc, gap=1.0, claim=claim)
             # run_growth_tasks() reports its total as "earned_credit";
             # reading the old "credit_added" name silently summed zeros
             # and the dashboard always showed "+0 积分".
@@ -19755,6 +19809,27 @@ class Handler(BaseHTTPRequestHandler):
             "credit_added": total_credit,
             "logs": combined_logs,
             "accounts_count": len(targets)
+        })
+
+    def _route_tasks_claim(self, payload):
+        if not POOL:
+            return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
+        uid = payload.get("uid")
+        code = str(payload.get("code") or "").strip()
+        if not uid or uid == "all":
+            return self._json_panel(200, {"ok": False, "msg": "请先选择一个国内版账号"})
+        if not code:
+            return self._json_panel(200, {"ok": False, "msg": "缺少任务代码"})
+        target = POOL.get(uid)
+        if not target or target.realm != "cn":
+            return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
+        from wb_tasks import claim_task
+        res = claim_task(target, code)
+        invalidate_tasks_cache()
+        return self._json_panel(200, {
+            "ok": bool(res.get("ok")),
+            "msg": res.get("msg") or ("领取成功" if res.get("ok") else "领取失败"),
+            "credit": res.get("credit", 0),
         })
 
     def _route_tasks_streak_bonus(self, payload):
@@ -21037,7 +21112,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account, effort = open_upstream(
                 payload, session_key=session_key, target_realm=req_realm,
-                prebuilt_body=forwarded)
+                prebuilt_body=forwarded, defer_egress_success=True)
         except PinnedAccountError as exc:
             record_error(model, exc.status, exc.message[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -21092,25 +21167,36 @@ class Handler(BaseHTTPRequestHandler):
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
         with upstream:
+            def reopen_stream():
+                # Same account, same egress: only the TCP connection is new.
+                return open_upstream(
+                    payload, session_key=session_key, target_realm=req_realm,
+                    prebuilt_body=forwarded, pin_account=account,
+                    defer_egress_success=True)
             if want_stream:
                 return self._chat_stream_response(
-                    upstream, model, fp, account, t_start, effort=effort)
+                    upstream, model, fp, account, t_start, effort=effort,
+                    reopen=reopen_stream)
             return self._chat_nonstream_response(
                 upstream, model, fp, account, t_start, effort=effort)
 
-    def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None):
+    def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
+                              reopen=None, headers_sent=False, retried=False):
             # Reuse one encoder for all chunks in this stream.  The response shape
             # is unchanged; only JSONEncoder construction is removed from the hot
             # per-frame path.
             encode_json = json.JSONEncoder(ensure_ascii=False).encode
-            self.send_response(200)
+            if not headers_sent:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                if cors_origin_allowed(self.path):
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+            # A retry reuses the headers already on the wire; the client has not
+            # seen a single byte, so a fresh chunk id is safe.
             stream_chunk_id = f"chatcmpl-wb-{uuid.uuid4().hex[:16]}"
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            if cors_origin_allowed(self.path):
-                self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
             emitted = False
             last_usage = None
             first_ms = None
@@ -21125,6 +21211,15 @@ class Handler(BaseHTTPRequestHandler):
             # 攒到「下一个可能阻塞的读之前」再写，不改变任何延迟：块边界就是
             # socket 里当前已经有的全部字节（见 iter_sse_lines 的 before_read）。
             out_buf = []
+            # Egress accounting is settled when the read finishes, not when the
+            # headers arrive: a stream that dies mid-body must leave a streak
+            # behind (issue #522). retried means this request already had a
+            # failed read; a successful retry does not erase that signal.
+            egress_on = wb_settings.egress_backoff_enabled(ACCOUNTS_DIR)
+            egress_key = None
+            if egress_on:
+                egress_key = wb_upstream_pool.egress_key(
+                    account.chat_base_url() + CHAT_PATH, account.proxy)
 
             def flush_out():
                 if out_buf:
@@ -21224,6 +21319,34 @@ class Handler(BaseHTTPRequestHandler):
                 # Upstream quit mid-stream (timeout, incomplete read, ...).
                 # The client would otherwise get a truncated stream with no
                 # terminal marker, and the traceback reached the HTTP layer.
+                if egress_on and egress_key:
+                    # The egress did not finish the read; record it here instead
+                    # of at header time so the streak can actually grow.
+                    wb_egress.note_transient(egress_key)
+                if not emitted and reopen is not None:
+                    # Nothing reached the client yet, so a transparent retry on
+                    # the same account/egress looks like a TCP reconnect. One
+                    # retry only; the recursive call reuses the sent headers.
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+                    new_upstream = None
+                    try:
+                        new_upstream, new_account, new_effort = reopen()
+                    except Exception:
+                        new_upstream = None
+                    if new_upstream is not None:
+                        try:
+                            return self._chat_stream_response(
+                                new_upstream, model, fp, new_account, t_start,
+                                effort=new_effort, reopen=None,
+                                headers_sent=True, retried=True)
+                        finally:
+                            try:
+                                new_upstream.close()
+                            except Exception:
+                                pass
                 wall = int((time.time() - t_start) * 1000)
                 record_error(model, 502, "stream aborted: %s" % exc,
                              elapsed_ms=wall, account=account.uid,
@@ -21243,6 +21366,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {err}\n\n".encode("utf-8"))
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
+            if egress_on and egress_key and emitted and not retried:
+                # A full read (not a retried one) ends the streak.
+                wb_egress.note_success(egress_key)
             wall = int((time.time() - t_start) * 1000)
             if last_usage is None or (last_usage.get("total_tokens") or 0) == 0:
                 full_s = "".join(streamed_text)
@@ -21270,12 +21396,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None):
+        egress_on = wb_settings.egress_backoff_enabled(ACCOUNTS_DIR)
+        egress_key = None
+        if egress_on:
+            egress_key = wb_upstream_pool.egress_key(
+                account.chat_base_url() + CHAT_PATH, account.proxy)
         try:
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
+            if egress_on and egress_key:
+                wb_egress.note_transient(egress_key)
             record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
                          account=account.uid, key=self._key_id())
             return self._error(502, f"upstream stream error: {exc}")
+        if egress_on and egress_key:
+            wb_egress.note_success(egress_key)
         wall = int((time.time() - t_start) * 1000)
         first_at = result.get("first_chunk_at")
         # Measured from request arrival so streaming and non-streaming are comparable.

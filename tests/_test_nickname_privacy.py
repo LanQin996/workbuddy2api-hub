@@ -335,7 +335,7 @@ class PostRoutePayloadTest(unittest.TestCase):
         payload = self._run(
             "_route_tasks_run", {"uid": acct.uid}, [acct],
             [(wb_tasks, "run_growth_tasks",
-              lambda acc, gap=1.0: {"earned_credit": 5, "logs": ["step ok"]})])
+              lambda acc, gap=1.0, claim=True: {"earned_credit": 5, "logs": ["step ok"]})])
         blob = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn(PHONE, blob)
         self.assertIn(PHONE_MASKED, blob)
