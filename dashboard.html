@@ -2432,7 +2432,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '连接中断:': 'Connection lost:',
     '连续打卡天数': 'Check-in streak',
     '退出面板登录': 'Sign out of the dashboard',
-    '选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的': 'Pick an account JSON file. It accepts files exported by this gateway, an account array, a single account object, and the one of the desktop client',
+    '选择一个或多个账号 JSON 文件。每个文件支持本网关导出的文件、账号数组、单个账号对象，以及桌面客户端的': 'Pick one or more account JSON files. Each file may be a gateway export, account array, single account object, or the desktop client format',
     '选择要登录的版本：': 'Choose the version to sign in to:',
     '选择颜色主题': 'Choose a color theme',
     '速度': 'Speed',
@@ -3080,7 +3080,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "连接中断:": "連線中斷:",
     "连接中断: ": "連線中斷: ",
     "退出面板登录": "退出面板登入",
-    "选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的": "選擇一個帳號 JSON 檔案。支援本閘道匯出的檔案、帳號陣列、單個帳號物件， 以及桌面客戶端的",
+    "选择一个或多个账号 JSON 文件。每个文件支持本网关导出的文件、账号数组、单个账号对象，以及桌面客户端的": "選擇一個或多個帳號 JSON 檔案。每個檔案支援本閘道匯出的檔案、帳號陣列、單個帳號物件，以及桌面客戶端格式",
     "选择要登录的版本：": "選擇要登入的版本：",
     "逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）": "逐個重新整理所有帳號的上游訪問憑證（相當於對每個帳號點一次「重新整理憑證」）",
     "部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的顺序自动轮换，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。": "部分客戶端（如 Codex App）會宣告 web_search / web_fetch 這類服務端工具，而上游沒有對應的執行器：宣告送上去，模型看到工具卻沒有執行器，客戶端最後只拿到一句 unsupported call。開啟後由本閘道代跑——把宣告換成自己的同名函式，在本地執行（搜尋按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的順序自動輪換，抓頁面抓這個 URL）再把結果喂回模型。預設關閉，關閉時宣告原樣透傳，客戶端自己宣告的搜尋工具照常拿到呼叫。",
@@ -5279,7 +5279,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
     <div class="modal-bd">
       <p class="hint" style="margin-top:0">
-        选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象，
+        选择一个或多个账号 JSON 文件。每个文件支持本网关导出的文件、账号数组、单个账号对象，
         以及桌面客户端的 <code>{"account":…,"auth":…}</code> 格式。
       </p>
       <div id="importBody"><p class="hint">尚未选择文件。</p></div>
@@ -8663,9 +8663,11 @@ async function exportOne(uid){
 }
 
 let importRows = null;   // 已解析、待导入的账号行
+let importFileNames = [];
 
 function openImport(){
   importRows = null;
+  importFileNames = [];
   const m = document.getElementById('importModal');
   const body = document.getElementById('importBody');
   const ow = document.getElementById('importOverwrite');
@@ -8676,10 +8678,11 @@ function openImport(){
   const picker = document.createElement('input');
   picker.type = 'file';
   picker.accept = '.json,application/json';
+  picker.multiple = true;
   picker.onchange = () => {
-    const f = picker.files && picker.files[0];
-    if(!f){ closeImport(); return; }
-    readImportFile(f);
+    const files = Array.from(picker.files || []);
+    if(!files.length){ closeImport(); return; }
+    readImportFiles(files);
   };
   picker.click();
 }
@@ -8688,40 +8691,44 @@ function closeImport(){
   const m = document.getElementById('importModal');
   if(m) m.classList.remove('show');
   importRows = null;
+  importFileNames = [];
   const btn = document.getElementById('btnImportCommit');
   if(btn) btn.disabled = true;
 }
 
-async function readImportFile(file){
+async function readImportFiles(files){
   const body = document.getElementById('importBody');
   try{
-    const text = await file.text();
-    let doc;
-    try{ doc = JSON.parse(text); }
-    catch(e){ throw new Error('文件不是合法 JSON'); }
+    const parsed = await Promise.all(files.map(async file => {
+      let doc;
+      try{ doc = JSON.parse(await file.text()); }
+      catch(e){ throw new Error(file.name + '：文件不是合法 JSON'); }
 
-    // Accept the export document, a bare array, or a single account object.
-    let rows;
-    if(Array.isArray(doc)) rows = doc;
-    else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
-    else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
-    else throw new Error('文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');
+      // Accept the export document, a bare array, or a single account object.
+      let rows;
+      if(Array.isArray(doc)) rows = doc;
+      else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
+      else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
+      else throw new Error(file.name + '：没有找到账号（既没有 accounts 数组，也不是单个账号）');
+      if(!rows.length) throw new Error(file.name + '：账号列表是空的');
+      return {name: file.name, rows: rows};
+    }));
+    importRows = parsed.reduce((all, file) => all.concat(file.rows), []);
+    importFileNames = parsed.map(file => file.name);
 
-    if(!rows.length) throw new Error('账号列表是空的');
-    importRows = rows;
-
-    // Dry-run first so the user sees exactly what will happen.
-    const r = await postJSON('/accounts/import', {data: doc, dryRun: true});
-    renderImportPreview(file.name, r.result || {}, rows.length);
+    // Validate the merged list once so duplicate UIDs across files are handled together.
+    const r = await postJSON('/accounts/import', {data: importRows, dryRun: true});
+    renderImportPreview(importFileNames, r.result || {}, importRows.length);
   }catch(e){
     importRows = null;
+    importFileNames = [];
     const btn = document.getElementById('btnImportCommit');
     if(btn) btn.disabled = true;
     if(body) body.innerHTML = '<p class="hint" style="color:var(--warn)">读取失败: ' + esc(e.message) + '</p>';
   }
 }
 
-function renderImportPreview(filename, res, total){
+function renderImportPreview(filenames, res, total){
   const body = document.getElementById('importBody');
   const btn = document.getElementById('btnImportCommit');
   const added = res.added || [], updated = res.updated || [];
@@ -8733,7 +8740,7 @@ function renderImportPreview(filename, res, total){
     return '<li><code>' + esc(String(uid).slice(0,8)) + '</code>' + reason + '</li>';
   }).join('');
 
-  let html = '<p class="hint" style="margin-top:0">文件：<b>' + esc(filename) + '</b>'
+  let html = '<p class="hint" style="margin-top:0">文件：<b>' + filenames.map(esc).join('、') + '</b>'
     + ' · 共 ' + total + ' 条</p>';
   html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">'
     + '<span>新增 <b style="color:var(--accent2)">' + added.length + '</b></span>'
@@ -8776,7 +8783,7 @@ async function commitImport(btn){
           + '，跳过 ' + (res.skipped || []).length
           + '，无效 ' + (res.invalid || []).length);
     if(n > 0){ closeImport(); await loadAccounts(); }
-    else { renderImportPreview('（已导入）', res, importRows.length); }
+    else { renderImportPreview(['（已导入）'], res, importRows.length); }
   }catch(e){
     toast('导入失败: ' + e.message, 'err');
     if(btn){ btn.disabled = false; btn.textContent = '确认导入'; }

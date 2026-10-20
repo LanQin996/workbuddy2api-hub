@@ -149,6 +149,16 @@ for(const [zh, en] of [['一键切换所有出站身份：', 'Switch all outboun
     'DICT 里缺少「' + zh + '」的英文词条');
 }
 
+/* ---- 1d. 多文件账号导入 --------------------------------------------- */
+assert.ok(/选择一个或多个账号 JSON 文件/.test(html), '导入说明应明确支持多选 JSON');
+assert.ok(/picker\.multiple\s*=\s*true/.test(script), '文件选择器应允许多选');
+assert.ok(/const files = Array\.from\(picker\.files \|\| \[\]\)/.test(script),
+  '应读取选择的全部文件');
+assert.ok(/postJSON\('\/accounts\/import', \{data: importRows, dryRun: true\}\)/.test(script),
+  '多文件合并后应统一 dry-run');
+assert.ok(/postJSON\('\/accounts\/import', \{data: importRows, overwrite: overwrite\}\)/.test(script),
+  '确认导入应一次提交合并后的账号数组');
+
 
 /* ---- 2. 行为：拼查询串、渲染、翻页、出错 ---------------------------- */
 
