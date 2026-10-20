@@ -10201,7 +10201,7 @@ AFFINITY_BY_PREFIX = os.environ.get("WB_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
-# Flat prompts (system + one ever-growing user string) have no stable second
+# Flat prompts (system + one ever-growing user content) have no stable second
 # message to hash. Opt in to hashing only a fixed user prefix for that shape.
 def _parse_nonnegative_int(value, default=0):
     try:
@@ -10216,6 +10216,33 @@ def _parse_nonnegative_int(value, default=0):
 
 AFFINITY_FLAT_USER_PREFIX_CHARS = _parse_nonnegative_int(
     os.environ.get("WB_AFFINITY_FLAT_USER_PREFIX_CHARS", "0") or 0)
+
+
+def _affinity_user_text(content):
+    """The user message's text, whether it is a string or OpenAI/Responses parts.
+
+    The flat-prompt fallback has to see through both shapes a client sends the
+    same history in. A client that switches to content parts - `[{"type":
+    "text", "text": ...}]`, which several SDKs do for long prompts - used to
+    fall out of the fallback entirely and go back to hashing the whole ever-
+    growing message, so every turn derived a new key and the pool rotated it
+    away. Returns "" for anything that carries no text (an image-only turn,
+    say), which leaves that turn on the legacy key exactly as before.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    texts = []
+    for piece in content:
+        if isinstance(piece, str):
+            texts.append(piece)
+        elif isinstance(piece, dict):
+            ptype = piece.get("type") or ""
+            if ptype in ("input_text", "output_text", "text", "summary_text"):
+                texts.append(piece.get("text") or "")
+    return "".join(texts)
+
 # 亲和的上限：对话超过这么多条消息后不再绑定账号。
 #
 # 为什么需要上限：亲和把整段对话钉在同一个账号上，而对话的上下文是单调
@@ -10244,8 +10271,16 @@ AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
 # 轮，页里每个账号都留着前缀；同时超大请求体仍摊在 size 个账号上，不是压回
 # 一个（那正是 400 条上限要解决的断连问题）。
 #
-# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
-# 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
+# 取值：≥2 = 页数（不是页宽！页宽 = 本区域账号数 / 该值，见 _page_slice）；
+# 1 = 和普通对话一样钉住（等于取消上限）；0 = 保持 1.6.x 的整池轮转。
+#
+# 调参提示：3 是按「一二十个账号的池子」标定的，那时每页只有 5~7 个号，
+# 「再见到」的周期还在缓存存活期内。这个值是页数不是页宽，所以池子变大时页
+# 会跟着变宽：同一份配置在 82 个账号的池子上变成每页 28 个号，回到同一账号
+# 要等 20~70 分钟，前缀早已过期——实测（2026-10-20，本实例）超长对话的命中率
+# 由 87.3% 掉到 49.9%，71% 的 prompt token 花在「这个账号第一次见到这段对话」。
+# 池子上到几十个号时应同步调大（82 个号配 16 即每页 5~6 个）。默认值保持 3，
+# 不改动既有部署的行为。
 AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
 def affinity_route(messages, explicit_session_key=None):
     """This conversation's (session_key, page).
@@ -10267,17 +10302,18 @@ def affinity_route(messages, explicit_session_key=None):
             return None, None
         head = msgs[:2]
         prefix_chars = AFFINITY_FLAT_USER_PREFIX_CHARS
+        flat_text = ""
         if (prefix_chars > 0 and len(msgs) == 2
                 and isinstance(msgs[0], dict)
                 and msgs[0].get("role") == "system"
                 and isinstance(msgs[1], dict)
-                and msgs[1].get("role") == "user"
-                and isinstance(msgs[1].get("content"), str)
-                and len(msgs[1]["content"]) > prefix_chars):
+                and msgs[1].get("role") == "user"):
+            flat_text = _affinity_user_text(msgs[1].get("content"))
+        if len(flat_text) > prefix_chars:
             # Copy both messages before replacing only the derived hash input;
             # never mutate the caller's outgoing payload.
             head = [dict(msgs[0]), dict(msgs[1])]
-            head[1]["content"] = head[1]["content"][:prefix_chars]
+            head[1]["content"] = flat_text[:prefix_chars]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
         digest = hashlib.sha256(blob).hexdigest()[:16]
         key = "pfx-" + digest

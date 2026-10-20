@@ -34,20 +34,24 @@ try {
 
 const S = (n) => ({ avg: n, p50: n, samples: 1 });
 const S3 = (n) => ({ avg: n, p50: n, samples: 3 });
-const dsRow = (req, tot, p, c) => ({ requests: req, total_tokens: tot, prompt_tokens: p, completion_tokens: c, reasoning_tokens: 0, cached_tokens: 0 });
+const dsRow = (req, tot, p, c, cached) => ({ requests: req, total_tokens: tot, prompt_tokens: p, completion_tokens: c, reasoning_tokens: 0, cached_tokens: cached || 0 });
 const usage = {
   requests: 4, total_tokens: 8300, prompt_tokens: 6600, completion_tokens: 1700, reasoning_tokens: 0,
+  // 4,140 of 6,600 prompt tokens were served from cache. The debounced model
+  // row hits at 90%, the glm row at 0%, so the mean of per-request percentages
+  // (45.0%) and the token-weighted share (62.7%) cannot be confused.
+  cached_tokens: 4140,
   by_model: {
-    'deepseek-v4.1-flash': dsRow(3, 5800, 4600, 1200),
-    'glm-5.3':            dsRow(1, 2500, 2000, 500),
+    'deepseek-v4.1-flash': dsRow(3, 5800, 4600, 1200, 4140),
+    'glm-5.3':            dsRow(1, 2500, 2000, 500, 0),
   },
   by_model_realm: {
-    'deepseek-v4.1-flash': { intl: dsRow(3, 5800, 4600, 1200) },
-    'glm-5.3':            { intl: dsRow(1, 2500, 2000, 500) },
+    'deepseek-v4.1-flash': { intl: dsRow(3, 5800, 4600, 1200, 4140) },
+    'glm-5.3':            { intl: dsRow(1, 2500, 2000, 500, 0) },
   },
   by_model_acct: {
-    'deepseek-v4.1-flash': { intl: { 'acct-A': dsRow(3, 5800, 4600, 1200) } },
-    'glm-5.3':            { intl: { 'acct-B': dsRow(1, 2500, 2000, 500) } },
+    'deepseek-v4.1-flash': { intl: { 'acct-A': dsRow(3, 5800, 4600, 1200, 4140) } },
+    'glm-5.3':            { intl: { 'acct-B': dsRow(1, 2500, 2000, 500, 0) } },
   },
   accounts_map: { 'acct-A': { nickname: 'Hades', realm: 'intl' }, 'acct-B': { nickname: 'lenguedogahz', realm: 'intl' } },
 };
@@ -149,6 +153,43 @@ api.fillMatrixFilters(todayUsage);
 const [a2, m2] = api.getFilters();
 check('dropped model filter is cleared', m2 === '', m2);
 check('still-valid account filter survives', a2 === 'acct-A', a2);
+
+console.log();
+console.log('[6] cache total is token-weighted, not the mean of per-request percentages');
+const summaryCache = (html) => summaryCell(html, '缓存命中');
+api.setFilters('', '');
+api.renderPerfMatrix(usage, perf);
+out = document.getElementById('perfMatrix').innerHTML;
+// 4,140 / 6,600 = 62.7%. The arithmetic mean of the two rows' percentages is
+// 45.0% (90% and 0% averaged) - a figure that says nothing about how much of
+// the prompt was actually reused.
+check('unfiltered total is 62.7%', summaryCache(out) === '62.7%', summaryCache(out));
+check('not the per-row mean of 45.0%', summaryCache(out) !== '45.0%', summaryCache(out));
+
+console.log();
+console.log('[7] a filtered total re-derives from the visible rows only');
+api.setFilters('', 'deepseek-v4.1-flash');
+api.renderPerfMatrix(usage, perf);
+out = document.getElementById('perfMatrix').innerHTML;
+check('filtered total is the row own 90.0%', summaryCache(out) === '90.0%', summaryCache(out));
+api.setFilters('acct-B', '');
+api.renderPerfMatrix(usage, perf);
+out = document.getElementById('perfMatrix').innerHTML;
+check('account with no cache hits reads 0.0%', summaryCache(out) === '0.0%', summaryCache(out));
+
+console.log();
+console.log('[8] no prompt tokens: dash, not a fake 0%');
+api.setFilters('', '');
+const noTokens = JSON.parse(JSON.stringify(usage));
+[noTokens, noTokens.by_model['deepseek-v4.1-flash'], noTokens.by_model['glm-5.3']].forEach(r => {
+  r.prompt_tokens = 0; r.cached_tokens = 0; r.total_tokens = 0;
+});
+noTokens.by_model_realm = {};
+noTokens.by_model_acct = {};
+noTokens.requests = 0;
+api.renderPerfMatrix(noTokens, Object.assign({}, perf, {errors: 0}));
+out = document.getElementById('perfMatrix').innerHTML;
+check('cache cell is a dash', summaryCache(out) === '-', summaryCache(out));
 
 console.log();
 console.log('PASS=' + pass + ' FAIL=' + fail);

@@ -13772,25 +13772,26 @@ function renderPerfMatrix(usage, perf){
      * barely-used row cannot outvote a heavily-used one.
      */
     const filtering = !!(matrixAcctFilter || matrixModelFilter);
-    let sumReq, sumErr, sumTok, sumP, sumC, sumR, totTtft, totTps, totWall, totCache, sumCost;
+    let sumReq, sumErr, sumTok, sumP, sumC, sumR, sumCached, totTtft, totTps, totWall, totCache, sumCost;
     if(!filtering){
       sumReq = usage.requests; sumErr = perf.errors; sumTok = usage.total_tokens;
       sumP = usage.prompt_tokens; sumC = usage.completion_tokens; sumR = usage.reasoning_tokens;
+      sumCached = usage.cached_tokens || 0;
       // OpenRouter 价估算的合计：未筛选时取出口级汇总（与上面的数字同源）。
       sumCost = usage.cost_cny || 0;
       totTtft = perf.ttft_ms ? (ms(perf.ttft_ms.avg) + " (P50 " + ms(perf.ttft_ms.p50) + ")") : "-";
       totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1) + " tok/s") : "-";
       totWall = perf.wall_ms ? ms(perf.wall_ms.avg) : "-";
-      totCache = perf.cache_hit_pct ? (perf.cache_hit_pct.avg.toFixed(1) + "%") : "-";
     } else {
-      sumReq = 0; sumErr = 0; sumTok = 0; sumP = 0; sumC = 0; sumR = 0; sumCost = 0;
-      let ttftW = 0, ttftN = 0, tpsW = 0, tpsN = 0, wallW = 0, wallN = 0, cacheW = 0, cacheN = 0;
+      sumReq = 0; sumErr = 0; sumTok = 0; sumP = 0; sumC = 0; sumR = 0; sumCached = 0; sumCost = 0;
+      let ttftW = 0, ttftN = 0, tpsW = 0, tpsN = 0, wallW = 0, wallN = 0;
       rowsData.forEach(m => {
         sumReq += m.requests || 0;
         sumTok += m.total_tokens || 0;
         sumP += m.prompt_tokens || 0;
         sumC += m.completion_tokens || 0;
         sumR += m.reasoning_tokens || 0;
+        sumCached += m.cached_tokens || 0;
         sumCost += m.cost_cny || 0;
         const mp = ((perf && perf.by_model_realm) || {})[m.id] || {};
         const mpAcctAll = ((perf && perf.by_model_acct) || {})[m.id] || {};
@@ -13802,13 +13803,29 @@ function renderPerfMatrix(usage, perf){
         if(e.ttft_ms && e.ttft_ms.samples){ ttftW += e.ttft_ms.avg * e.ttft_ms.samples; ttftN += e.ttft_ms.samples; }
         if(e.tokens_per_sec && e.tokens_per_sec.samples){ tpsW += e.tokens_per_sec.avg * e.tokens_per_sec.samples; tpsN += e.tokens_per_sec.samples; }
         if(e.wall_ms && e.wall_ms.samples){ wallW += e.wall_ms.avg * e.wall_ms.samples; wallN += e.wall_ms.samples; }
-        if(e.cache_hit_pct && e.cache_hit_pct.samples){ cacheW += e.cache_hit_pct.avg * e.cache_hit_pct.samples; cacheN += e.cache_hit_pct.samples; }
       });
       totTtft = ttftN ? ms(ttftW / ttftN) : "-";
       totTps = tpsN ? (((tpsW / tpsN)).toFixed(1) + " tok/s") : "-";
       totWall = wallN ? ms(wallW / wallN) : "-";
-      totCache = cacheN ? ((cacheW / cacheN).toFixed(1) + "%") : "-";
     }
+    /* Cache total is the token-weighted ratio, not the mean of per-request
+     * percentages.
+     *
+     * The old figure averaged `cache_hit_pct` over the perf samples, which
+     * weights a 27-token request exactly as heavily as a 200k-token one. On
+     * this deployment the tiny requests are the ones that never hit (the
+     * upstream caches in ~128-token blocks, so a 27-token prompt cannot hit by
+     * construction) and they outnumber the big ones, which dragged the summary
+     * to 73% while the actual share of prompt tokens served from cache was
+     * 85.5% - the same data, two very different numbers, and the wrong one was
+     * on screen. Summing tokens keeps the summary consistent with the KPI card,
+     * with the per-row 缓存命中 cell (also token-derived) and with what a cache
+     * hit actually costs.
+     */
+    totCache = sumP > 0
+      ? ((Math.min(sumCached, sumP) / sumP * 100).toFixed(1) + "%")
+      : "-";
+
     const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td style="text-align:left" data-label="模型"><b>' + (filtering ? '筛选结果合计 (Filtered)' : '全部模型合计 (Total)') + '</b></td>'
       + '<td style="text-align:center" data-label="区域"><span style="color:var(--dim)">—</span></td>'

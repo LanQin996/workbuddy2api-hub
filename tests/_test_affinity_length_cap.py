@@ -87,15 +87,43 @@ class FlatUserAffinityTests(unittest.TestCase):
         other_shapes = [
             [{"role": "user", "content": "x" * 30}],
             [{"role": "system", "content": "s"},
-             {"role": "user", "content": ["x" * 30]}],
-            [{"role": "system", "content": "s"},
              {"role": "assistant", "content": "x" * 30}],
             self.messages("x" * 30) + [{"role": "assistant", "content": "y"}],
+            # No text to hash: an image-only turn stays on the legacy key.
+            [{"role": "system", "content": "s"},
+             {"role": "user", "content": [{"type": "image_url",
+                                           "image_url": {"url": "data:image/png;base64,AA"}}]}],
         ]
         for messages in other_shapes:
             with self.subTest(messages=messages):
                 self.assertEqual(self.legacy_key(messages),
                                  wb_proxy.derive_affinity_key(messages))
+
+    def test_content_parts_are_flat_prompts_too(self):
+        """A user message in OpenAI/Responses parts must take the same fallback.
+
+        Several SDKs switch a long prompt from `content: "..."` to parts. While
+        the fallback tested `isinstance(content, str)` those turns fell back to
+        hashing the whole ever-growing message, so every turn derived a new key
+        and the pool rotated the conversation away - 5 identical requests over
+        5 accounts with `cached_tokens: 0` each, measured on the live gateway.
+        """
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        as_string = self.messages("opening!" + "x" * 40)
+        as_parts = self.messages([{"type": "text", "text": "opening!" + "x" * 40}])
+        self.assertEqual(wb_proxy.derive_affinity_key(as_string),
+                         wb_proxy.derive_affinity_key(as_parts))
+        # The fallback has to apply to parts too, not just hash them whole.
+        later = self.messages([{"type": "text", "text": "opening!" + "x" * 40 + " more turns"}])
+        self.assertEqual(wb_proxy.derive_affinity_key(as_parts),
+                         wb_proxy.derive_affinity_key(later))
+
+    def test_parts_text_is_joined_in_order(self):
+        self.assertEqual("abcdef",
+                         wb_proxy._affinity_user_text(
+                             [{"type": "text", "text": "abc"}, "def"]))
+        self.assertEqual("", wb_proxy._affinity_user_text(None))
+        self.assertEqual("", wb_proxy._affinity_user_text({"not": "a list"}))
 
     def test_prefix_fallback_does_not_mutate_payload(self):
         wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
