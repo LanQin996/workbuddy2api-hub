@@ -75,5 +75,39 @@ class NormalizeAliasesTests(unittest.TestCase):
         self.assertEqual(fields["total_tokens"], 105)
 
 
+class ProtocolUsageTests(unittest.TestCase):
+    def test_responses_usage_reads_every_cache_alias(self):
+        cases = (
+            {"cached_tokens": 12},
+            {"cache_read_input_tokens": 12},
+            {"input_tokens_details": {"cached_tokens": 12}},
+            {"prompt_tokens_details": {"cached_tokens": 12}},
+            {"completion_tokens_details": {"cached_tokens": 12}},
+        )
+        for usage in cases:
+            result = proxy._responses_usage({"prompt_tokens": 20, **usage})
+            self.assertEqual(result["input_tokens_details"]["cached_tokens"], 12,
+                             usage)
+
+    def test_responses_usage_zero_alias_does_not_shadow_a_hit(self):
+        result = proxy._responses_usage({
+            "prompt_tokens": 20,
+            "prompt_cache_hit_tokens": 0,
+            "cache_read_input_tokens": 7,
+            "cached_tokens": 0,
+        })
+        self.assertEqual(result["input_tokens_details"]["cached_tokens"], 7)
+
+    def test_anthropic_usage_zero_alias_does_not_shadow_a_hit(self):
+        result = proxy._anthropic_usage({
+            "prompt_tokens": 20,
+            "prompt_cache_hit_tokens": 0,
+            "cache_read_input_tokens": 7,
+            "cached_tokens": 0,
+        })
+        self.assertEqual(result["cache_read_input_tokens"], 7)
+        self.assertEqual(result["input_tokens"], 13)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

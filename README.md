@@ -453,6 +453,12 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **扁平长上下文的会话亲和回退（默认关闭）**：未提供显式会话标识，且消息恰为 `system` + 单条字符串 `user` 时，可设置 `WB_AFFINITY_FLAT_USER_PREFIX_CHARS=8192`，让持续增长的长 user 内容按固定前缀派生亲和键；内容不超过阈值时仍使用旧键，`0`、负数或无效配置关闭回退。显式会话键及其他消息结构不变，不按 `user_id` 合并会话。
+
+- **修复「一键刷新积分」必定失败（NameError → 502）**：`_credits_sweep` 的账号间拟人间隔写了 `random.uniform(...)`，但 `wb_proxy.py` 从来没有 `import random`。零间隔或单值间隔会被 `lo if hi <= lo` 短路掉，**只有默认的 800~1200ms 区间**才会真的走到那一行——所以任何人点「一键刷新积分」（或账号页自动补快照）都必定 `NameError`：异常从 `do_POST` 抛穿处理线程，网关不发响应直接断连，前面挂反代时浏览器看到的正是「刷新积分失败: 502」。补上 `import random`。原有用例把间隔改成 120ms 单值，恰好绕开了随机分支；`tests/_test_credits_sweep_guard.py` 增两例强制走区间分支并显式钉住模块级 import（现 19 例）。
+
+- **统一 Responses / Anthropic 缓存 usage 别名解析**：两种协议现在与 usage 记录采用相同的最佳正缓存命中值；上游首选字段为 0 时不会遮蔽其他字段里的有效命中数。Chat 流与落盘统计口径不变。
+
 - **全局对话并发支持不限模式**：设置 `WB_MAX_CONCURRENT_CHAT=0` 后，Chat / Responses / Messages 不再等待全局并发名额或返回该门禁的 503。默认值仍为 32，正整数及 `auto` 模式保持兼容；API Key 的独立并发设置仍单独生效。
 
 - **上下文超限错误支持客户端恢复**：新增 `WB_CONTEXT_ERROR_NORMALIZE=1`（默认关闭）。开启后，Chat / Responses 对上游 HTTP 400、JSON 顶层 `code=11115` 返回标准 `invalid_request_error` / `context_length_exceeded`，保留原始错误消息，方便支持该错误码的客户端压缩历史；网关不自动裁剪消息。
@@ -486,7 +492,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **静默启动会告知"已有实例在运行"**：pythonw 的 stdout/stderr 指向空设备，"已有一个反代在 8788 端口运行，无需重复启动"这句话用户永远看不到，双击只表现为"启动失败"。启动脚本改为先在本窗口用 `wb_proxy.py --probe-only` 跑同一段探测（退出码 0=已有实例／端口被别的服务占用，3=端口空闲可启动），已有实例时把原因打印出来并停住等按键；`start-wb-proxy.bat` 与 `start-wb-proxy-lan.bat` 都已接入。
 - **网关模型清单可勾选**：「网关模型清单」每行模型 ID 前新增复选框（**默认全部勾选**，表头带「全选 / 全不选 / 反选」三个批量动作），只有勾选的模型才会被一键配置写进客户端的模型清单；选择持久化在 `accounts/settings.json` 的 `agent_models`，并新增 `GET/POST /agents/model-selection` 接口（§8）。
 - **面板与日志出口统一脱敏账号手机号**（#415 跟进）：账号昵称常被设成手机号，此前面板 JSON、日志看板、stderr、`/logs/export` 与账号导出文档一律明文。现在 66 处面板出口走新增的 `_json_panel` / `_json_cached_panel` 封装（LLM 的 `/v1` 生成路由保持 `_json`，模型输出一字不动，有源码级用例钉住）；日志在 level/tag 推断之后才掩码，分类不受掩码影响；账号导出两条路（`?download=1` 与内联）共用一次脱敏。匹配只认整值 11 位手机号与文本内三段分组形态（容忍空格/点/中点等常见分隔符），数字边界保护 26 位订单号、10 位时间戳不被误切；掩码幂等、copy-on-write，不污染共享 TTL 缓存。新增 `tests/_test_nickname_privacy.py`（34 例）。
-- **全量刷积分加并发与节奏护栏**：「一键刷新积分」（POST `/accounts/credits`）与 GET `/accounts/credits` 在不带 uid/realm 时对整池逐个发上游计费请求，此前没有单飞也没有账号间隔——真机上出现过 10 秒内 9 次全量刷（约 207 次上游调用），触发条件是某账号始终拿不到快照、前端每 15 秒重试一次。现在：多账号目标先抢 CAS 单飞，抢不到直接回 `200 + busy=true` 与当前快照（不排队、不算错）；账号之间按 800~1200ms 随机间隔（`WB_CREDITS_SWEEP_GAP_MS` 可改，0 为关闭）；带 uid 的单账号刷新不受影响。新增 `tests/_test_credits_sweep_guard.py`（17 例）。
+- **全量刷积分加并发与节奏护栏**：「一键刷新积分」（POST `/accounts/credits`）与 GET `/accounts/credits` 在不带 uid/realm 时对整池逐个发上游计费请求，此前没有单飞也没有账号间隔——真机上出现过 10 秒内 9 次全量刷（约 207 次上游调用），触发条件是某账号始终拿不到快照、前端每 15 秒重试一次。现在：多账号目标先抢 CAS 单飞，抢不到直接回 `200 + busy=true` 与当前快照（不排队、不算错）；账号之间按 800~1200ms 随机间隔（`WB_CREDITS_SWEEP_GAP_MS` 可改，0 为关闭）；带 uid 的单账号刷新不受影响。新增 `tests/_test_credits_sweep_guard.py`（19 例）。
 
 - **修复 DSH 一键配置后仍不能识图**（#385 的后续修正）：DSH 的 pi-ai 适配器只认模型条目里的 `input`（`inputModalities`），不读 `supportsVision`，也不读 `/v1/models` 里的能力字段。此前一键配置只写 `supportsVision: true`，贴图会被 DSH 拒掉：`Model "<id>" does not support image input.`。现在多模态模型写 `input: [text, image]`，纯文本模型（如 `glm-5.3-flash`）不写。
 - **DSH 一键配置改写 profile 补丁层**：当前 DSH 只在首次启动导入一次 `~/.dsh/settings.yaml`，之后真正生效的是 `~/.dsh/profiles/*/cordis.patch.yml`。一键配置现在直接更新这一层（`settings.yaml` 只在它本来就有、或机器上还没有 profile 时写入），且只替换 `wb-proxy` 那段，patch 里的其他 provider、条目与注释原样保留。

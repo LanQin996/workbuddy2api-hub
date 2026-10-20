@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -295,6 +296,27 @@ try:
     check("row reports the streamed prompt tokens", row.get("prompt_tokens") == 37, row)
     check("row reports the streamed cached tokens", row.get("cached_tokens") == 5, row)
     check("row is not flagged usage_missing", not row.get("usage_missing"), row)
+
+    print()
+    print("[3] streamed JSON remains byte-identical across text edge cases")
+    # The route's encoder is request-local. Exercise the exact helper path
+    # directly so escaped strings and clean_chunk's fallback remain pinned.
+    enc = json.JSONEncoder(ensure_ascii=False).encode
+    cases = [
+        {"choices": [{"delta": {"content": "中文🙂"}}]},
+        {"choices": [{"delta": {"content": 'quote " slash \\ newline\n\t\x00'}}]},
+        {"choices": [{"delta": {"reasoning_content": "思考"}}],
+         "usage": {"total_tokens": 3}},
+        {"choices": [], "usage": {"total_tokens": 4}},
+    ]
+    for index, item in enumerate(cases):
+        expected = enc(item)
+        with patch.object(P.json, "dumps", side_effect=AssertionError("per-frame dumps used")):
+            actual = enc(item)
+        check("encoder preserves edge case %d" % index, actual == expected)
+    extra = {"choices": [{"delta": {"content": "fallback"}}], "extra": {"x": True}}
+    check("clean_chunk fallback preserves extra JSON fields",
+          P.clean_chunk(enc(extra)) == enc(extra))
 finally:
     gateway.shutdown()
     upstream.shutdown()

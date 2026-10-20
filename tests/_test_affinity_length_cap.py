@@ -35,6 +35,89 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wb_proxy
 
 
+class FlatUserAffinityTests(unittest.TestCase):
+    """Opt-in stable routing for flattened, growing single-user prompts."""
+
+    def setUp(self):
+        self._saved_prefix_chars = wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS
+
+    def tearDown(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = self._saved_prefix_chars
+
+    @staticmethod
+    def messages(content):
+        return [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": content},
+        ]
+
+    def legacy_key(self, messages):
+        blob = wb_proxy.json.dumps(
+            messages[:2], ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return "pfx-" + wb_proxy.hashlib.sha256(blob).hexdigest()[:16]
+
+    def test_default_off_preserves_the_legacy_key(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 0
+        messages = self.messages("opening" + "x" * 40)
+        self.assertEqual(self.legacy_key(messages),
+                         wb_proxy.derive_affinity_key(messages))
+
+    def test_appended_tail_keeps_the_key_after_the_gate(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        first = self.messages("opening! first history")
+        later = self.messages("opening! first history plus later turns")
+        self.assertEqual(wb_proxy.derive_affinity_key(first),
+                         wb_proxy.derive_affinity_key(later))
+
+    def test_prefix_changes_and_distinct_openings_get_distinct_keys(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        long_tail = "x" * 20
+        a = self.messages("opening!" + long_tail)
+        changed_prefix = self.messages("openinG!" + long_tail)
+        separate = self.messages("separate" + long_tail)
+        self.assertNotEqual(wb_proxy.derive_affinity_key(a),
+                            wb_proxy.derive_affinity_key(changed_prefix))
+        self.assertNotEqual(wb_proxy.derive_affinity_key(a),
+                            wb_proxy.derive_affinity_key(separate))
+
+    def test_short_prompt_and_other_shapes_keep_the_legacy_hash(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        short = self.messages("12345678")
+        self.assertEqual(self.legacy_key(short), wb_proxy.derive_affinity_key(short))
+        other_shapes = [
+            [{"role": "user", "content": "x" * 30}],
+            [{"role": "system", "content": "s"},
+             {"role": "user", "content": ["x" * 30]}],
+            [{"role": "system", "content": "s"},
+             {"role": "assistant", "content": "x" * 30}],
+            self.messages("x" * 30) + [{"role": "assistant", "content": "y"}],
+        ]
+        for messages in other_shapes:
+            with self.subTest(messages=messages):
+                self.assertEqual(self.legacy_key(messages),
+                                 wb_proxy.derive_affinity_key(messages))
+
+    def test_prefix_fallback_does_not_mutate_payload(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        messages = self.messages("opening!" + "x" * 30)
+        original = [dict(message) for message in messages]
+        wb_proxy.derive_affinity_key(messages)
+        self.assertEqual(original, messages)
+
+    def test_explicit_session_key_bypasses_derived_key(self):
+        wb_proxy.AFFINITY_FLAT_USER_PREFIX_CHARS = 8
+        key, page = wb_proxy.affinity_route(
+            self.messages("opening!" + "x" * 30),
+            explicit_session_key="client-session")
+        self.assertEqual(("client-session", None), (key, page))
+
+    def test_nonpositive_and_malformed_settings_disable_fallback(self):
+        self.assertEqual(0, wb_proxy._parse_nonnegative_int("-12"))
+        self.assertEqual(0, wb_proxy._parse_nonnegative_int("bad"))
+        self.assertEqual(0, wb_proxy._parse_nonnegative_int(None))
+        self.assertEqual(7, wb_proxy._parse_nonnegative_int("bad", default=7))
+
+
 def conversation(length):
     """A conversation of exactly `length` messages, stable prefix first."""
     msgs = [{"role": "system", "content": "you are a helpful assistant"}]

@@ -19,6 +19,13 @@ internal/scheduler/staggered.go：
 间隔可用 WB_CREDITS_SWEEP_GAP_MS 覆盖（"min-max" 或单个数字，0 = 关掉）。这个开关
 必须容错：环境变量写坏了要回默认，而不是让整个功能不可用。
 
+回归（真机现场）：`_credits_sweep` 写着 `random.uniform(...)` 却没有
+`import random`。单值/零间隔会被 `lo if hi <= lo` 短路掉，只有**默认区间**才会
+真的走到随机那一行——于是本套件原先那条「设 120ms 单值」的用例完全绕开了缺陷，
+真机上点「一键刷新积分」却 100% NameError。异常从 `do_POST` 抛穿 HTTP 处理线程，
+客户端看到的是连接被断开（前面挂反代时就是 502），面板只显示「刷新积分失败: 502」。
+现在有一条用例强制走区间分支，并显式钉住模块级 `import random`。
+
 Run with: python tests/run_all.py credits_sweep
 """
 import inspect
@@ -167,6 +174,31 @@ class SweepTests(unittest.TestCase):
         for d in delays:
             self.assertGreaterEqual(d, 0.11, "间隔应落在 120ms 附近，实际 %r" % (delays,))
             self.assertLessEqual(d, 0.13, "间隔应落在 120ms 附近，实际 %r" % (delays,))
+
+    def test_randomized_range_gap_does_not_raise(self):
+        """默认 800~1200ms 是**区间**，走 random.uniform。
+
+        回归：wb_proxy 曾经只写了 `random.uniform(...)` 却没有 `import random`，
+        而上面那条用例把间隔设成单值（lo == hi，命中 `lo if hi <= lo` 短路）恰好
+        绕开了随机分支，于是全绿。真机默认区间一路 NameError，异常从
+        `_route_accounts_credits_fetch` 抛穿 do_POST、连接被直接断开，面板上就是
+        「刷新积分失败: 502」。这条用例必须真的走 random 那条路。
+        """
+        os.environ[GAP_ENV] = "800-1200"
+        delays = []
+        with mock.patch.object(wb_proxy.time, "sleep", delays.append):
+            res = wb_proxy._credits_sweep(
+                [FakeAccount("u1"), FakeAccount("u2")], paced=True)
+        self.assertEqual(len(res), 2)
+        self.assertEqual(len(delays), 1, "2 个账号只有 1 个间隔")
+        self.assertGreaterEqual(delays[0], 0.8)
+        self.assertLessEqual(delays[0], 1.2)
+
+    def test_module_imports_random(self):
+        """显式钉住 import：区间分支用的是模块级 random，靠别的模块捎带不算数。"""
+        self.assertTrue(hasattr(wb_proxy, "random"),
+                        "wb_proxy 必须自己 import random")
+        self.assertTrue(hasattr(wb_proxy.random, "uniform"))
 
     def test_zero_gap_env_keeps_it_fast(self):
         os.environ[GAP_ENV] = "0"

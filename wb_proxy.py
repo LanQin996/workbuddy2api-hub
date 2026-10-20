@@ -23,6 +23,7 @@ import heapq
 import io
 import ipaddress
 from collections import deque
+import random
 import re
 import json
 import os
@@ -10184,6 +10185,21 @@ AFFINITY_BY_PREFIX = os.environ.get("WB_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
+# Flat prompts (system + one ever-growing user string) have no stable second
+# message to hash. Opt in to hashing only a fixed user prefix for that shape.
+def _parse_nonnegative_int(value, default=0):
+    try:
+        fallback = max(0, int(default))
+    except (TypeError, ValueError):
+        fallback = 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return fallback
+
+
+AFFINITY_FLAT_USER_PREFIX_CHARS = _parse_nonnegative_int(
+    os.environ.get("WB_AFFINITY_FLAT_USER_PREFIX_CHARS", "0") or 0)
 # 亲和的上限：对话超过这么多条消息后不再绑定账号。
 #
 # 为什么需要上限：亲和把整段对话钉在同一个账号上，而对话的上下文是单调
@@ -10215,7 +10231,7 @@ AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
 # 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
 # 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
 AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
-def affinity_route(messages):
+def affinity_route(messages, explicit_session_key=None):
     """This conversation's (session_key, page).
 
     `session_key` is the stable conversation key; `page` is the (index, size)
@@ -10225,6 +10241,8 @@ def affinity_route(messages):
     the same head hash, so every turn of a conversation agrees on its key and
     its page without any server-side state.
     """
+    if explicit_session_key:
+        return explicit_session_key, None
     if not AFFINITY_BY_PREFIX:
         return None, None
     try:
@@ -10232,6 +10250,18 @@ def affinity_route(messages):
         if not msgs:
             return None, None
         head = msgs[:2]
+        prefix_chars = AFFINITY_FLAT_USER_PREFIX_CHARS
+        if (prefix_chars > 0 and len(msgs) == 2
+                and isinstance(msgs[0], dict)
+                and msgs[0].get("role") == "system"
+                and isinstance(msgs[1], dict)
+                and msgs[1].get("role") == "user"
+                and isinstance(msgs[1].get("content"), str)
+                and len(msgs[1]["content"]) > prefix_chars):
+            # Copy both messages before replacing only the derived hash input;
+            # never mutate the caller's outgoing payload.
+            head = [dict(msgs[0]), dict(msgs[1])]
+            head[1]["content"] = head[1]["content"][:prefix_chars]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
         digest = hashlib.sha256(blob).hexdigest()[:16]
         key = "pfx-" + digest
@@ -11370,7 +11400,19 @@ def clean_chunk(raw):
         obj = json.loads(raw)
     except Exception:
         return raw
-    changed = False
+    return _clean_chunk_obj(obj, raw)
+
+
+def _clean_chunk_obj(obj, raw, mutated=False):
+    """clean_chunk core for an already-decoded frame.
+
+    Chat streaming parses every upstream SSE frame anyway; reusing that
+    object here avoids a second json.loads per frame on the hot path.
+    """
+    # The chat stream pops "usage"/"finish_reason" before calling here;
+    # re-encode whenever the caller mutated the object so dropped keys
+    # cannot leak to the client through the untouched-raw fast path.
+    changed = mutated
     if isinstance(obj.get("usage"), dict):
         before = dict(obj["usage"])
         normalize_usage_cache_aliases(obj["usage"])
@@ -13892,11 +13934,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
     # 有值（页内轮转），客户端自带会话键的请求不参与。
     affinity_page = None
-    if not session_key:
-        session_key, affinity_page = affinity_route(upstream_body.get("messages"))
-        if session_key and AFFINITY_DEBUG:
-            log("affinity: derived %s for %d msgs"
-                % (session_key, len(upstream_body.get("messages") or [])))
+    supplied_session_key = session_key
+    session_key, affinity_page = affinity_route(
+        upstream_body.get("messages"), explicit_session_key=session_key)
+    if session_key and not supplied_session_key and AFFINITY_DEBUG:
+        log("affinity: derived %s for %d msgs"
+            % (session_key, len(upstream_body.get("messages") or [])))
     # 一轮 user send 的 request id：官方 CLI 在这一轮的所有请求（含重试/换号）
     # 复用同一个 X-Conversation-Request-ID / X-Root-Request-ID，只有 message id
     # 每请求新生成（见 wb_identity.new_turn_request_id）。生成在重试循环外，
@@ -16105,10 +16148,7 @@ def _anthropic_usage(usage):
 
     prompt_tokens = _as_int(usage.get("prompt_tokens"))
     out["output_tokens"] = _as_int(usage.get("completion_tokens"))
-    cached = usage.get("prompt_cache_hit_tokens")
-    if cached is None:
-        cached = _best_cached_tokens(usage)
-    cache_read = _as_int(cached)
+    cache_read = _best_cached_tokens(usage)
     cache_creation = _as_int(usage.get("prompt_cache_write_tokens"))
     out["cache_read_input_tokens"] = cache_read
     out["cache_creation_input_tokens"] = cache_creation
@@ -16408,12 +16448,12 @@ def _responses_usage(u):
     if not u:
         return None
     det = u.get("completion_tokens_details") or {}
-    pdet = u.get("prompt_tokens_details") or {}
     return {
         "input_tokens": u.get("prompt_tokens") or 0,
         "input_tokens_details": {
-            "cached_tokens": u.get("prompt_cache_hit_tokens")
-            or det.get("cached_tokens") or pdet.get("cached_tokens") or 0,
+            # Providers put the hit count in different aliases. Keep the
+            # Responses API output aligned with usage rows and Chat streams.
+            "cached_tokens": _best_cached_tokens(u),
         },
         "output_tokens": u.get("completion_tokens") or 0,
         "output_tokens_details": {"reasoning_tokens": det.get("reasoning_tokens") or 0},
@@ -21059,6 +21099,10 @@ class Handler(BaseHTTPRequestHandler):
                 upstream, model, fp, account, t_start, effort=effort)
 
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None):
+            # Reuse one encoder for all chunks in this stream.  The response shape
+            # is unchanged; only JSONEncoder construction is removed from the hot
+            # per-frame path.
+            encode_json = json.JSONEncoder(ensure_ascii=False).encode
             self.send_response(200)
             stream_chunk_id = f"chatcmpl-wb-{uuid.uuid4().hex[:16]}"
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -21112,11 +21156,13 @@ class Handler(BaseHTTPRequestHandler):
                     if not data or data == "[DONE]" or data.startswith(":"):
                         continue
                     maybe = None
+                    frame_mutated = False
                     try:
                         maybe = json.loads(data)
                     except Exception:
                         maybe = None
                     if isinstance(maybe, dict):
+                        frame_mutated = False
                         u = maybe.get("usage")
                         if u:
                             if last_usage is None or (u.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0):
@@ -21128,6 +21174,7 @@ class Handler(BaseHTTPRequestHandler):
                             # then ends without billable usage. Re-emitted once
                             # below, after the finish frame.
                             maybe.pop("usage", None)
+                            frame_mutated = True
                         for ch in (maybe.get("choices") or []):
                             delta = ch.get("delta") or {}
                             if delta.get("reasoning_content"):
@@ -21140,6 +21187,7 @@ class Handler(BaseHTTPRequestHandler):
                                 # reads it as prose ends the turn with nothing to
                                 # run ("it keeps stopping by itself").
                                 delta.pop("content", None)
+                                frame_mutated = True
                                 release(leak_filter.feed(piece))
                             if ch.get("finish_reason"):
                                 # Hold the terminator too: whether this turn ends
@@ -21147,9 +21195,12 @@ class Handler(BaseHTTPRequestHandler):
                                 # been flushed at end of stream.
                                 pending_finish = ch["finish_reason"]
                                 ch["finish_reason"] = None
-                    cleaned = clean_chunk(
-                        json.dumps(maybe, ensure_ascii=False)
-                        if isinstance(maybe, dict) else data)
+                                frame_mutated = True
+                    if isinstance(maybe, dict):
+                        cleaned = _clean_chunk_obj(
+                            maybe, data, mutated=frame_mutated)
+                    else:
+                        cleaned = clean_chunk(data)
                     if not cleaned:
                         continue
                     write_chunk(cleaned)
