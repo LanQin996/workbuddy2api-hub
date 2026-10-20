@@ -51,6 +51,15 @@ class WorkflowTests(unittest.TestCase):
 
 
 class DockerTests(unittest.TestCase):
+    def test_docker_publishes_main_and_latest_on_main_push(self):
+        text = read(".github", "workflows", "docker-publish.yml")
+        self.assertIn("push:", text)
+        self.assertIn("branches: [main]", text)
+        self.assertIn("type=ref,event=branch", text)
+        self.assertIn("type=raw,value=latest,enable=${{ github.event_name == 'push' }}", text)
+        self.assertIn("type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}", text)
+        self.assertIn("platforms: linux/amd64,linux/arm64", text)
+
     def test_healthcheck_probes_the_health_endpoint(self):
         text = read("Dockerfile")
         self.assertIn("HEALTHCHECK", text)

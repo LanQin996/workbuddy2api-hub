@@ -67,7 +67,7 @@
 
 ### 5. Docker 部署
 
-预编译双架构镜像（`linux/amd64`、`linux/arm64`）发布在 GHCR 与 Docker Hub，**无需克隆代码、无需本地编译**：
+预编译双架构镜像（`linux/amd64`、`linux/arm64`）发布在 GHCR 与 Docker Hub，**无需克隆代码、无需本地编译**。每次提交到 `main` 会自动构建并更新 `:main` 与 `:latest`；正式稳定版 Release 也会发布版本号标签并更新 `:latest`（预发布版不会覆盖）：
 
 **方式一：一键脚本（推荐）**
 
@@ -452,6 +452,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- Docker 镜像工作流新增 `main` 分支推送触发，自动构建并推送 `main` 与 `latest` 标签；稳定 Release 的版本标签与 `latest` 发布行为保持不变。
 
 - 账号导入支持一次选择多个 JSON 文件；所有文件会合并预检并一次提交，跨文件重复 UID 统一按覆盖选项处理。
 
