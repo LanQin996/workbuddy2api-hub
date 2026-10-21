@@ -13261,8 +13261,7 @@ def gateway_hint(status, message):
             or "account has been restricted" in lower
             or "unusual activity" in lower):
         return ("上游已对该账号做账号级风控限制（403 / code 11140）；网关已让该账号"
-                "冷却并停止换号重试。请勿换号或高频重试（同设备账号会连坐），"
-                "按 WorkBuddy 官方渠道申诉，通常 1-3 个工作日自动解除。")
+                "冷却并停止换号重试。请勿换号或高频重试（同设备账号会连坐）。")
     if "no usable account" in lower or "no healthy account" in lower:
         return "no healthy account available in pool; check /status or retry later"
     if "本机网络不可用" in text or "local network unavailable" in lower:
@@ -13756,8 +13755,7 @@ def restriction_hold_message(realm, remaining):
     """整池暂停期间交给客户端的说明。"""
     return ("上游风控已限制本区域账号（403 / code 11140，账号存在异常行为）。"
             "网关已暂停派发 %d 秒，避免继续换号重试导致同设备账号连坐被封。"
-            "请勿换号或高频重试；按 WorkBuddy 官方渠道申诉（通常 1-3 个工作日"
-            "自动解除），解封后再恢复。 Upstream restricted the account(s); "
+            "请勿换号或高频重试。 Upstream restricted the account(s); "
             "dispatch paused %ds to avoid further bans."
             % (int(remaining), int(remaining)))
 
