@@ -351,6 +351,61 @@ def key_allows_model(entry, model):
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
+#: One key can name at most this many accounts. The pool is smaller than this
+#: in practice; the cap only stops a hand-edited file from growing the
+#: per-request filter without bound.
+KEY_ACCOUNTS_MAX = 200
+#: Account ids are UUIDs (36 chars); the length cap leaves room for a future
+#: shorter ref without accepting arbitrary text.
+KEY_ACCOUNT_MAX_LEN = 128
+
+
+def _clean_account_refs(value):
+    """Normalize one key's account allow-list into a list of account ids.
+
+    The panel posts a list; a hand-edited settings.json tends to hold a
+    comma-separated string, so both shapes are accepted. Matching is exact
+    (account uid), because a wildcard here would silently widen a restriction
+    meant to pin traffic to named accounts. An empty result means "no
+    restriction", which is what every key written before this field existed
+    reads back as.
+    """
+    if isinstance(value, str):
+        raw = [part for part in re.split(r"[,;\n]", value)]
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        ref = str(item or "").strip()
+        if not ref or len(ref.encode("utf-8")) > KEY_ACCOUNT_MAX_LEN:
+            continue
+        if ref not in out:
+            out.append(ref)
+        if len(out) >= KEY_ACCOUNTS_MAX:
+            break
+    return out
+
+
+def key_allowed_accounts(entry):
+    """The account ids a key may use, or None when it places no restriction.
+
+    None (not an empty set) is what the scheduler treats as "every account",
+    so an unrestricted key keeps the exact code path it had before.
+    """
+    refs = _clean_account_refs((entry or {}).get("accounts"))
+    return set(refs) if refs else None
+
+
+def key_allows_account(entry, uid):
+    """True when `entry` places no account restriction, or names `uid`."""
+    refs = _clean_account_refs((entry or {}).get("accounts"))
+    if not refs:
+        return True
+    return str(uid or "").strip() in refs
+
+
 def _clean_key_entry(entry):
     """Normalize one stored key entry; returns None when unusable.
 
@@ -379,6 +434,7 @@ def _clean_key_entry(entry):
         "key": key,
         "realm": realm,
         "models": _clean_model_patterns(entry.get("models")),
+        "accounts": _clean_account_refs(entry.get("accounts")),
         "concurrency_limit": concurrency,
         "enabled": False if deleted_at else entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
@@ -972,7 +1028,9 @@ def set_schedule_hours(accounts_dir, value):
         current = data.get("schedule")
         if not isinstance(current, dict):
             current = {}
-        merged = {}
+        # Keep keys this function does not own (schedule.daily_chat), so
+        # editing the hourly grid cannot silently drop the web-activity times.
+        merged = dict(current)
         for key in SCHEDULE_KEYS:
             if key in value:
                 hours = _normalize_hours(value.get(key))
@@ -985,6 +1043,82 @@ def set_schedule_hours(accounts_dir, value):
         data["schedule"] = merged
         save(accounts_dir, data)
     return merged
+
+
+#: 网页活跃（国际版每日活跃）的独立时段，HH:MM。空表示跟随 checkin 整点，
+#: 与旧版行为一致。24 个时段已经覆盖一整天的每个小时。
+DAILY_CHAT_TIMES_MAX = 24
+
+
+def _normalize_times(value):
+    """Coerce a list / comma string into sorted unique HH:MM strings, or None.
+
+    Full-width colons are accepted (the panel and a Chinese keyboard produce
+    them); anything that is not a two-part clock time is dropped. None means
+    "no valid entry", which the caller treats as a validation error on write
+    and as "unset" on read.
+    """
+    if isinstance(value, str):
+        raw = re.split(r"[,，\s]+", value.strip()) if value.strip() else []
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return None
+    out = set()
+    for item in raw:
+        text = str(item or "").strip().replace("：", ":")
+        if not text:
+            continue
+        parts = text.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            out.add("%02d:%02d" % (hour, minute))
+    return sorted(out)[:DAILY_CHAT_TIMES_MAX] if out else None
+
+
+def daily_chat_times(accounts_dir):
+    """The web-activity slots; [] means "follow the checkin hours"."""
+    raw = load(accounts_dir).get("schedule")
+    if not isinstance(raw, dict):
+        return []
+    return _normalize_times(raw.get("daily_chat")) or []
+
+
+def set_daily_chat_times(accounts_dir, value):
+    """Persist the web-activity slots; an empty value clears them.
+
+    Returns the normalized list. Invalid non-empty input raises ValueError so
+    the caller can answer 400 instead of storing a schedule that does nothing.
+    """
+    empty = False
+    if isinstance(value, str):
+        empty = not value.strip()
+    elif isinstance(value, (list, tuple)):
+        empty = not value
+    if empty:
+        times = []
+    else:
+        times = _normalize_times(value)
+        if times is None:
+            raise ValueError("schedule.daily_chat must be HH:MM times")
+    with _lock:
+        data = load(accounts_dir)
+        current = data.get("schedule")
+        if not isinstance(current, dict):
+            current = {}
+        if times:
+            current["daily_chat"] = times
+        else:
+            current.pop("daily_chat", None)
+        data["schedule"] = current
+        save(accounts_dir, data)
+    return times
 
 
 def section_max_height(accounts_dir):
@@ -1333,7 +1467,11 @@ def set_usage_config(accounts_dir, patch):
 PROMPT_DEFAULTS = {
     "mode": "passthrough",
     "file": "",
+    "text": "",
 }
+#: 在线全局提示词的上限。比文件路径宽松得多，但仍然有界：一个手滑的粘贴
+#: 不该让每个请求都多背几百 KB。
+PROMPT_TEXT_MAX = 64 * 1024
 
 
 def validate_prompt_patch(raw):
@@ -1351,6 +1489,13 @@ def validate_prompt_patch(raw):
             if not isinstance(value, str):
                 raise ValueError("prompt file must be a string")
             out["file"] = value.strip()
+        elif key == "text":
+            if not isinstance(value, str):
+                raise ValueError("prompt text must be a string")
+            if len(value.encode("utf-8")) > PROMPT_TEXT_MAX:
+                raise ValueError("prompt text cannot be more than %d bytes"
+                                 % PROMPT_TEXT_MAX)
+            out["text"] = value
         else:
             raise ValueError("unknown prompt setting %r" % key)
     return out
@@ -1369,7 +1514,10 @@ def prompt_config(accounts_dir):
     file_path = stored.get("file", PROMPT_DEFAULTS["file"])
     if not isinstance(file_path, str):
         file_path = PROMPT_DEFAULTS["file"]
-    return {"mode": mode, "file": file_path.strip()}
+    text = stored.get("text", PROMPT_DEFAULTS["text"])
+    if not isinstance(text, str):
+        text = PROMPT_DEFAULTS["text"]
+    return {"mode": mode, "file": file_path.strip(), "text": text}
 
 
 def set_prompt_config(accounts_dir, cfg):
@@ -1433,6 +1581,48 @@ def set_filter_models_by_key(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["filter_models_by_key"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def reasoning_effort_map(accounts_dir):
+    """Whether an unsupported reasoning_effort is mapped to the model default.
+
+    On by default: clients that expose a fixed level picker keep sending levels
+    a model does not accept, and the upstream rejects the whole request. An
+    install that predates the setting therefore keeps the new behaviour; only
+    an explicit false turns the mapping off.
+    """
+    return load(accounts_dir).get("reasoning_effort_map") is not False
+
+
+def set_reasoning_effort_map(accounts_dir, enabled):
+    """Persist the reasoning-effort mapping toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["reasoning_effort_map"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def models_only_available(accounts_dir):
+    """Whether /v1/models hides models no account in the pool can serve.
+
+    Off by default: the endpoint has always advertised the upstream catalogue,
+    and an install that predates this setting keeps that behaviour. When on,
+    a PRO-only model is only listed while a paid account exists, and any other
+    model needs at least one enabled account in the realm.
+    """
+    return load(accounts_dir).get("models_only_available") is True
+
+
+def set_models_only_available(accounts_dir, enabled):
+    """Persist the availability filter toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["models_only_available"] = enabled
         save(accounts_dir, data)
     return enabled
 
@@ -1515,8 +1705,53 @@ def identity_private_data(accounts_dir):
     return value if value in IDENTITY_PRIVATE_DATA_VALUES else "auto"
 
 
+IDENTITY_VERSION_KEYS = (
+    "desktop_intl", "desktop_cn", "desktop_cli",
+    "vscode_product", "vscode_ide", "cli", "sdk", "node",
+)
+IDENTITY_VERSION_MAX_LEN = 64
+_IDENTITY_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$")
+
+
+def _clean_identity_versions(raw):
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for key in IDENTITY_VERSION_KEYS:
+        value = str(raw.get(key) or "").strip()
+        if not value:
+            continue
+        if (len(value.encode("utf-8")) > IDENTITY_VERSION_MAX_LEN
+                or not _IDENTITY_VERSION_RE.match(value)):
+            raise ValueError("identity_versions.%s must be a version string" % key)
+        out[key] = value
+    return out
+
+
+def identity_versions(accounts_dir):
+    """Panel-set version overrides; {} means "use the verified defaults"."""
+    try:
+        return _clean_identity_versions(load(accounts_dir).get("identity_versions"))
+    except ValueError:
+        return {}
+
+
+def set_identity_versions(accounts_dir, versions):
+    """Persist version overrides; an empty dict clears them."""
+    clean = _clean_identity_versions(versions)
+    with _lock:
+        data = load(accounts_dir)
+        if clean:
+            data["identity_versions"] = clean
+        else:
+            data.pop("identity_versions", None)
+        save(accounts_dir, data)
+    return clean
+
+
 def identity_config(accounts_dir):
-    return {"private_data": identity_private_data(accounts_dir)}
+    return {"private_data": identity_private_data(accounts_dir),
+            "versions": identity_versions(accounts_dir)}
 
 
 def set_identity_private_data(accounts_dir, value):
@@ -1770,7 +2005,7 @@ def set_daily_chat_model(accounts_dir, model):
 #: 网页通道一轮等多久（秒）的默认值。与 wb_accounts.WEB_TURN_TIMEOUT 同值：
 #: 没配过的部署保持既有行为，改过的部署按自己配的来。
 DAILY_CHAT_WEB_TIMEOUT_DEFAULT = 120
-#: 上限只是防手滑。每轮等待时间翻倍，配成几百秒会让单账号最坏情况跑到小时级。
+#: 上限只是防手滑。每轮等待时间按首轮递增，配成几百秒会让单账号最坏情况跑到小时级。
 DAILY_CHAT_WEB_TIMEOUT_MAX = 3600
 #: 网页通道总共试几次（含第一轮）的默认值，与 wb_accounts.WEB_TURN_ATTEMPTS 同值。
 DAILY_CHAT_WEB_ATTEMPTS_DEFAULT = 3
@@ -1867,6 +2102,180 @@ def set_daily_chat_web_timeout(accounts_dir, seconds):
         data["daily_chat_web_timeout"] = seconds
         save(accounts_dir, data)
     return seconds
+
+
+#: 回退模型组合的条数上限。网页活跃每次只发一句短提示词，组合过长的收益
+#: 只是把等待时间摊长，20 条已经覆盖目录里的免费与低价模型。
+DAILY_CHAT_WEB_FALLBACK_MAX_MODELS = 20
+#: 单个模型 id 的长度上限，与其它列表型设置保持一致。
+DAILY_CHAT_WEB_FALLBACK_MODEL_MAX_LEN = 128
+
+
+def _clean_fallback_models(value):
+    """Coerce a list / comma string into a deduplicated model-id list."""
+    if isinstance(value, str):
+        raw = value.replace("，", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    seen = set()
+    for item in raw:
+        model = str(item or "").strip()
+        if not model or len(model.encode("utf-8")) > DAILY_CHAT_WEB_FALLBACK_MODEL_MAX_LEN:
+            continue
+        if model in seen:
+            continue
+        seen.add(model)
+        out.append(model)
+        if len(out) >= DAILY_CHAT_WEB_FALLBACK_MAX_MODELS:
+            break
+    return out
+
+
+#: 随机池的条数上限：内置 300 条全选 + 200 条自定义。池里存的是完整列表
+#: （选中的内置提示词与自定义提示词混在一起），所以上限按两者之和给。
+DAILY_CHAT_WEB_PROMPTS_MAX = 500
+#: 单条提示词的长度上限（UTF-8 字节）。与 Go 版的 200 字节保持一致。
+DAILY_CHAT_WEB_PROMPT_MAX_LEN = 200
+
+
+def _clean_web_prompts(value):
+    """Coerce a list / newline string into deduplicated prompt lines."""
+    if isinstance(value, str):
+        raw = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    seen = set()
+    for item in raw:
+        prompt = str(item or "").strip()
+        if not prompt:
+            continue
+        if len(prompt.encode("utf-8")) > DAILY_CHAT_WEB_PROMPT_MAX_LEN:
+            continue
+        if prompt in seen:
+            continue
+        seen.add(prompt)
+        out.append(prompt)
+        if len(out) >= DAILY_CHAT_WEB_PROMPTS_MAX:
+            break
+    return out
+
+
+def daily_chat_web_fallback(accounts_dir):
+    """Whether a failed web turn falls back to the next model.
+
+    Off by default: an install that predates the setting keeps retrying the
+    same model, which is the behaviour that earned the daily credits until now.
+    """
+    return load(accounts_dir).get("daily_chat_web_fallback") is True
+
+
+def set_daily_chat_web_fallback(accounts_dir, enabled):
+    """Persist the web-channel model-fallback toggle. Returns the stored bool."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_fallback"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web_random_prompt(accounts_dir):
+    """Whether the web leg draws a random prompt instead of always sending Hi.
+
+    Off by default: the daily activity is one throwaway turn, and an install
+    that predates the setting keeps sending the same one-word prompt it always
+    did.
+    """
+    return load(accounts_dir).get("daily_chat_web_random_prompt") is True
+
+
+def set_daily_chat_web_random_prompt(accounts_dir, enabled):
+    """Persist the random-prompt toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_random_prompt"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web_fallback_models(accounts_dir):
+    """The model combination to fall back through; [] means "use the default".
+
+    Order is not significant: the caller sorts the candidates by catalogue
+    credits, so the free model runs before a low-credit one and that one before
+    an expensive one.
+    """
+    return _clean_fallback_models(
+        load(accounts_dir).get("daily_chat_web_fallback_models"))
+
+
+def set_daily_chat_web_fallback_models(accounts_dir, models):
+    """Persist the fallback combination. Returns the normalized list."""
+    cleaned = _clean_fallback_models(models)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_fallback_models"] = cleaned
+        save(accounts_dir, data)
+    return cleaned
+
+
+def daily_chat_web_prompts(accounts_dir):
+    """User-added prompts, appended to the built-in pool when the draw runs."""
+    return _clean_web_prompts(load(accounts_dir).get("daily_chat_web_prompts"))
+
+
+def set_daily_chat_web_prompts(accounts_dir, prompts):
+    """Persist the custom prompt lines. Returns the normalized list."""
+    cleaned = _clean_web_prompts(prompts)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_prompts"] = cleaned
+        save(accounts_dir, data)
+    return cleaned
+#: 网页活跃同时跑几个账号。默认 1 = 保持逐账号串行的旧行为；调大后按这个
+#: 上限并发跑当天的国际版活跃，上限只是防手滑（每个并发都是一次真实上游会话）。
+DAILY_CHAT_WEB_CONCURRENCY_DEFAULT = 1
+DAILY_CHAT_WEB_CONCURRENCY_MAX = 10
+
+
+def daily_chat_web_concurrency(accounts_dir, default=None):
+    """How many intl daily-activity conversations may run at once.
+
+    ``default`` is what an unset install gets (1, the serial behaviour), so a
+    caller with its own built-in default keeps it. Out-of-range or non-integer
+    values fall back to it too, so a hand-edited settings.json cannot turn the
+    sweep into an unbounded burst.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_CONCURRENCY_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_concurrency")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > DAILY_CHAT_WEB_CONCURRENCY_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_concurrency(accounts_dir, value):
+    """Persist the concurrency limit. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("daily_chat_web_concurrency must be a whole number")
+    if value < 1:
+        raise ValueError("daily_chat_web_concurrency cannot be less than 1")
+    if value > DAILY_CHAT_WEB_CONCURRENCY_MAX:
+        raise ValueError("daily_chat_web_concurrency cannot be more than %d"
+                         % DAILY_CHAT_WEB_CONCURRENCY_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_concurrency"] = value
+        save(accounts_dir, data)
+    return value
 
 
 def local_web_tools(accounts_dir):

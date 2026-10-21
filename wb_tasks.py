@@ -58,6 +58,11 @@ TASK_SPECS = {
     # first_buddy 是 auto 类（上游不接受接取），完成后领奖才发放 Buddy 实例；
     # 它是所有 single 任务与猫猫旅行的前置（"prerequisite not met: first_buddy"）。
     "first_buddy": {"kind": "chat", "target": 1, "reward": 300, "name": "领取一只 Buddy"},
+    # 活动任务：在专家页召唤「无畏契约拼豆专家」并完成一次对话。事件里的 id
+    # 必须是这个专家的真实 id，否则上游只接受事件但不推进进度。
+    "WorkBuddy_Valorant": {"kind": "expert", "target": 1, "reward": 100,
+                           "expert": ("ex_xQHHD1u5Jkua", "无畏契约拼豆专家"),
+                           "name": "体验「无畏契约拼豆专家」"},
     "wb_wechat_oa_subscribe_task": {"unforgeable": True, "reward": 100,
                                     "reason": "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时",
                                     "name": "关注官方公众号"},
@@ -590,9 +595,10 @@ def _progress_one(account, t, logs, gap, claim=True):
     id_pool = None
     if kind in ("expert", "team"):
         id_pool = TEAM_ID_POOL if kind == "team" else EXPERT_ID_POOL
+    fixed_expert = spec.get("expert")
     for i in range(need):
-        expert = None
-        if id_pool:
+        expert = fixed_expert
+        if expert is None and id_pool:
             pid, pnm = id_pool[(cur + i) % len(id_pool)]
             expert = (pid, pnm)
         ev = build_event(account, kind, idx=i, expert=expert)
