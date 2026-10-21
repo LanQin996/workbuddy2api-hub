@@ -326,6 +326,11 @@ class Scheduler:
             if hold > 0:
                 self.log(f"跳过 [{uid8}]：{acc.realm} 区域风控暂停剩余 {int(hold)}s")
                 continue
+            # Task participation is a separate switch from API dispatch: a
+            # disabled account can still run check-in / growth / travel /
+            # daily activity (issue #521). Keepalive below stays on for every
+            # account - it only keeps the credential fresh.
+            task_active = acc.task_active()
             # 1. 检查 Token 剩余寿命 (小于 2 小时自动刷新保活)
             if run_keepalive:
                 exp = acc.expires_at or 0
@@ -338,7 +343,7 @@ class Scheduler:
                         self.log(f"! 账号 [{uid8}] Token 保活刷新失败: {acc.last_error}")
 
             # 2. 如果是国内版账号，检查每日签到与猫猫旅行
-            if acc.realm == "cn":
+            if acc.realm == "cn" and task_active:
                 if run_checkin:
                     if acc.can_checkin():
                         self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
@@ -384,7 +389,7 @@ class Scheduler:
                     time.sleep(1.0)
 
             # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
-            if acc.realm == "intl" and run_daily_chat:
+            if acc.realm == "intl" and task_active and run_daily_chat:
                 if acc.can_daily_chat():
                     daily_chat_targets.append(acc)
 

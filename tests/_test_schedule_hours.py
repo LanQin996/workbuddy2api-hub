@@ -96,6 +96,7 @@ class FakeAccount(object):
     def __init__(self, realm="cn"):
         self.uid = "fake-uid-1234"
         self.realm = realm
+        self.tasks_enabled = True
         self.restricted_until = 0.0
         self.expires_at = 0.0
         self.last_error = ""
@@ -103,6 +104,9 @@ class FakeAccount(object):
         self.reports = 0
         self.daily = 0
         self.refreshes = 0
+
+    def task_active(self):
+        return self.tasks_enabled
 
     def can_checkin(self):
         return True
@@ -160,6 +164,37 @@ class TaskGatingTests(unittest.TestCase):
                 mock.patch.object(wb_scheduler.wb_tasks, "run_night_growth", night):
             scheduler._run_cycle("test", force=force)
         return seen
+
+    def test_task_flag_off_skips_tasks_but_keeps_keepalive(self):
+        with tempfile.TemporaryDirectory(prefix="sched-task-") as directory:
+            wb_settings.set_schedule_hours(directory, {
+                "checkin": [10, 20], "travel": [10, 20],
+                "keepalive": [10], "cat": [1],
+            })
+            scheduler = wb_scheduler.Scheduler(StubPool(directory))
+            account = FakeAccount()
+            account.tasks_enabled = False
+            account.expires_at = time.time() + 60
+            scheduler.pool.accounts = [account]
+
+            seen = self._run_at(scheduler, account, 10)
+            self.assertEqual((account.checkins, account.reports), (0, 0))
+            self.assertEqual((seen["travel"], seen["bonus"], seen["cat"]),
+                             (0, 0, 0))
+            self.assertEqual(account.refreshes, 1)
+
+    def test_task_flag_on_still_runs_checkin(self):
+        with tempfile.TemporaryDirectory(prefix="sched-task-") as directory:
+            wb_settings.set_schedule_hours(directory, {
+                "checkin": [10, 20], "travel": [10, 20],
+                "keepalive": [12], "cat": [1],
+            })
+            scheduler = wb_scheduler.Scheduler(StubPool(directory))
+            account = FakeAccount()
+            scheduler.pool.accounts = [account]
+
+            self._run_at(scheduler, account, 10)
+            self.assertEqual((account.checkins, account.reports), (1, 1))
 
     def test_cat_hour_does_not_run_checkin_or_travel(self):
         with tempfile.TemporaryDirectory(prefix="sched-gate-") as directory:

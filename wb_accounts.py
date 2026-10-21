@@ -642,6 +642,15 @@ class Account(object):
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
         self.proxy = self.proxy_legacy
         self.enabled = data.get("enabled", True)
+        # Task participation is independent of API dispatch: an account can be
+        # disabled for traffic but still run check-in / growth / travel / daily
+        # activity (issue #521). Accounts written before this field existed
+        # follow `enabled`, so a disabled account stays fully off until the
+        # operator opts it back in.
+        raw_tasks_enabled = data.get("tasksEnabled")
+        self.tasks_enabled = (bool(raw_tasks_enabled)
+                              if raw_tasks_enabled is not None
+                              else bool(self.enabled))
         # 手动调度权重（面板按账号设置，1 = 不干预）。随凭证档持久化：这是
         # 用户的明确分派意图，不该在重启后悄悄回到默认。非法值一律回落 1，
         # 坏数据不至于让账号加载失败。
@@ -841,6 +850,7 @@ class Account(object):
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
             "enabled": self.enabled,
+            "tasksEnabled": bool(self.tasks_enabled),
             "weight": self.weight,
             "note": self.note,
             "disabledModels": list(self.disabled_models),
@@ -904,6 +914,7 @@ class Account(object):
             "product": self.product,
             "enterpriseId": self.enterprise_id,
             "enabled": bool(self.enabled),
+            "tasksEnabled": bool(self.tasks_enabled),
             "weight": int(self.weight),
             "note": self.note,
             "disabledModels": list(self.disabled_models),
@@ -1624,6 +1635,13 @@ class Account(object):
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return True
+
+    def task_active(self):
+        """Whether scheduled / manual tasks may touch this account.
+
+        Independent of `enabled`: `enabled` only controls API dispatch.
+        """
+        return bool(self.tasks_enabled)
 
     def can_checkin(self):
         if self.realm != "cn":
@@ -3298,14 +3316,29 @@ class AccountPool(object):
             "invalid": invalid,
         }
 
-    def set_enabled(self, uid, enabled):
+    def set_enabled(self, uid, enabled, tasks_enabled=None):
         account = self.get(uid)
         if account is None: return None
         account.enabled = bool(enabled)
+        # Disabling stops tasks too unless the caller names the task flag
+        # explicitly; the panel sends both when it wants API-only or
+        # tasks-only behaviour.
+        account.tasks_enabled = (bool(tasks_enabled)
+                                 if tasks_enabled is not None
+                                 else bool(enabled))
         if enabled:
             account.clear_error()
         account.save(self.dir)
         self.apply_proxy_slots()
+        return account.public()
+
+    def set_tasks_enabled(self, uid, tasks_enabled):
+        """Toggle task participation without changing API dispatch."""
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.tasks_enabled = bool(tasks_enabled)
+        account.save(self.dir)
         return account.public()
 
     def set_weight(self, uid, weight):
@@ -3566,10 +3599,22 @@ class AccountPool(object):
             for account in self.accounts:
                 if realm and account.realm != realm: continue
                 account.enabled = bool(enabled)
+                account.tasks_enabled = bool(enabled)
                 if enabled:
                     account.clear_error()
                 account.save(self.dir)
         self.apply_proxy_slots()
+
+    def task_accounts(self, realm=None):
+        """Accounts that participate in scheduled / manual tasks.
+
+        Kept separate from the API pool: `enabled` controls dispatch, while
+        `task_active()` controls check-in, growth, travel and daily activity
+        (issue #521).
+        """
+        with self._lock:
+            return [a for a in self.accounts
+                    if (not realm or a.realm == realm) and a.task_active()]
 
     def count_ready(self, realm=None, model=None, allowed=None):
         with self._lock:
@@ -4295,6 +4340,7 @@ def _coerce_account_rows(blob):
         # and must be reported rather than silently treated as one account.
         looks_like_account = (
             blob.get("accessToken")
+            or blob.get("access_token")
             or isinstance(blob.get("auth"), dict)
             or isinstance(blob.get("account"), dict)
         )
@@ -4376,6 +4422,7 @@ def normalise_import_row(row, realm=None):
     if not uid:
         raise ValueError("cannot determine uid (no uid field and no sub claim)")
 
+    tasks_enabled = pick("tasksEnabled")
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
@@ -4388,6 +4435,10 @@ def normalise_import_row(row, realm=None):
         "expiresAt": normalize_epoch(pick("expiresAt")) or jwt_exp(token),
         "source": str(pick("source") or "import"),
         "enabled": True,
+        # Imported accounts start with tasks on (they are new to this pool);
+        # an export that carries the flag keeps the operator's choice.
+        "tasksEnabled": (bool(tasks_enabled)
+                         if tasks_enabled is not None else True),
         # Volatile state is intentionally reset - see VOLATILE_FIELDS.
         "lastError": "",
         "cooldownUntil": 0.0,

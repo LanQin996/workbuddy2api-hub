@@ -357,9 +357,13 @@ with patch.object(P, "_new_id", side_effect=lambda prefix: prefix + "test"), \
     handler = ResponseHandler()
     source = ResponseStream([chat_event({"content": "before failure"})], fail=True)
     run_response(handler, source)
-    check("Responses error: buffered text precedes DONE",
-          b"before failure" in handler.wfile.value()
-          and handler.wfile.value().endswith(b"data: [DONE]\n\n"))
+    response_error = handler.wfile.value()
+    check("Responses error: buffered text precedes error event",
+          b"before failure" in response_error
+          and response_error.endswith(b"\n\n")
+          and b"event: error\n" in response_error
+          and b"upstream_stream_error" in response_error
+          and not response_error.endswith(b"data: [DONE]\n\n"))
     check("Responses error: upstream closed", source.closed)
 
     # Without read1, obtaining the next item can itself block. Lifecycle frames
