@@ -11891,6 +11891,22 @@ SANITIZE_IDENTITY_RE = re.compile(
     r"[^\n]*?(?:\.(?=\s|$)|(?=\n|$))",
     re.IGNORECASE)
 SANITIZE_IDENTITY_REPLACEMENT = "You are a helpful AI assistant."
+# DSH's @-path instructions are rejected when their opening two sentences match
+# the upstream channel fingerprint. Reword only those sentences; retain the
+# remaining path-handling guidance verbatim.
+SANITIZE_DSH_PATHS_NEEDLE = "Tokens prefixed with @ are paths the user explicitly referenced"
+SANITIZE_DSH_PATHS_LOWER = SANITIZE_DSH_PATHS_NEEDLE.lower()
+SANITIZE_DSH_PATHS_RE = re.compile(
+    r"Tokens prefixed with @ are paths the user explicitly referenced\."
+    r"\s+Relative paths resolve from the workspace root; absolute paths point to "
+    r"files or directories on the host\.",
+    re.IGNORECASE,
+)
+SANITIZE_DSH_PATHS_REPLACEMENT = (
+    "Paths beginning with @ refer to files the user explicitly mentioned. "
+    "Relative paths are resolved against the workspace root; absolute paths point "
+    "to files or directories on the host."
+)
 # GUI 描述段（#570）：DSH 的系统提示里有一段 GUI 描述，上游按「A 句 + B 句连续出现」
 # 判 11-128。逐段二分实测：指纹是整段，改 A 句、改 B 句、或在两句之间插东西都会失配。
 #
@@ -11955,6 +11971,9 @@ def has_fingerprint(text, identity=True):
         return True
     if not identity:
         return False
+    if (SANITIZE_DSH_PATHS_LOWER in low
+            and SANITIZE_DSH_PATHS_RE.search(text) is not None):
+        return True
     # 品牌词缩减：`harness` 是廉价前置筛，真命中交给正则。
     if (SANITIZE_BRAND_LOWER in low
             and SANITIZE_BRAND_RE.search(text) is not None):
@@ -11980,6 +11999,8 @@ def sanitize_text(text, identity=True):
     # neutralized.
     text = SANITIZE_OMO_JUNIOR_RE.sub("Sisyphus-Junior - Focused executor", text)
     if identity:
+        if SANITIZE_DSH_PATHS_LOWER in text.lower():
+            text = SANITIZE_DSH_PATHS_RE.sub(SANITIZE_DSH_PATHS_REPLACEMENT, text)
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)

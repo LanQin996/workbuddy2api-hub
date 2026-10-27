@@ -209,6 +209,69 @@ class DshGuiParagraphTests(unittest.TestCase):
         self.assertIn("whose URL is named in the runtime context", system)
 
 
+class DshPathInstructionsTests(unittest.TestCase):
+    ORIGINAL = (
+        "Tokens prefixed with @ are paths the user explicitly referenced. "
+        "Relative paths resolve from the workspace root; absolute paths point to "
+        "files or directories on the host. A trailing slash marks a directory, so "
+        "list it when its contents matter. Anything else is a file: open it with "
+        "the read tool when its contents are needed, and never claim to have "
+        'inspected it before reading. The @"..." form only quotes a path that '
+        "contains spaces."
+    )
+    REWRITTEN = (
+        "Paths beginning with @ refer to files the user explicitly mentioned. "
+        "Relative paths are resolved against the workspace root; absolute paths "
+        "point to files or directories on the host. A trailing slash marks a "
+        "directory, so list it when its contents matter. Anything else is a file: "
+        "open it with the read tool when its contents are needed, and never claim "
+        'to have inspected it before reading. The @"..." form only quotes a path '
+        "that contains spaces."
+    )
+
+    def test_rewrites_the_confirmed_opening_sentences(self):
+        self.assertEqual(P.sanitize_text(self.ORIGINAL), self.REWRITTEN)
+        self.assertFalse(P.has_fingerprint(self.REWRITTEN))
+
+    def test_rewrites_when_embedded_in_a_long_system_prompt(self):
+        text = "Before the path rules.\n\n" + self.ORIGINAL + "\n\nAfter the rules."
+        self.assertEqual(
+            P.sanitize_text(text),
+            "Before the path rules.\n\n" + self.REWRITTEN + "\n\nAfter the rules.",
+        )
+
+    def test_case_insensitive_and_idempotent(self):
+        out = P.sanitize_text(self.ORIGINAL.upper())
+        self.assertEqual(P.sanitize_text(out), out)
+        self.assertNotIn("TOKENS PREFIXED WITH @", out)
+
+    def test_incomplete_or_unrelated_path_text_is_untouched(self):
+        for text in (
+            "Tokens prefixed with @ are paths the user explicitly referenced.",
+            "Relative paths resolve from the workspace root; absolute paths point to files.",
+            "Use @ to refer to a path in the workspace.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(P.sanitize_text(text), text)
+
+    def test_only_identity_roles_are_rewritten(self):
+        messages = [
+            {"role": role, "content": self.ORIGINAL}
+            for role in ("system", "developer", "assistant", "user", "tool")
+        ]
+        out = P.sanitize_messages(messages)
+        self.assertEqual([m["content"] for m in out[:3]], [self.REWRITTEN] * 3)
+        self.assertEqual([m["content"] for m in out[3:]], [self.ORIGINAL] * 2)
+
+    def test_wire_body_contains_the_rewrite(self):
+        body = P.build_upstream_body({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "system", "content": self.ORIGINAL},
+                         {"role": "user", "content": "hello"}],
+        })
+        self.assertEqual(body["messages"][0]["content"], self.REWRITTEN)
+
+
 class AssistantHistoryFingerprintTests(unittest.TestCase):
     """#574：assistant 历史里的身份句 / 品牌 + GUI 组合。
 
