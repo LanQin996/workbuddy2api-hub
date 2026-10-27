@@ -8,6 +8,7 @@ replace, and rollback.
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -88,6 +89,40 @@ class ExtractTests(unittest.TestCase):
                 zf.writestr("../evil.txt", "x")
             with self.assertRaises(U.UpdateError):
                 U.safe_extract(path, os.path.join(d, "out"), "wb-proxy")
+
+    def test_safe_extract_preserves_unix_modes(self):
+        # 启动脚本在包里是 755，解包后必须保持可执行：否则一键更新在
+        # macOS/Linux 的重启一步 Popen() 报 EACCES，整次更新被迫回滚。
+        # 没有 unix 属性的条目维持默认权限，不应被凭空赋予执行位。
+        # The launchers ship 755 and the restart Popen()s them, so a 644 copy
+        # rolls the whole update back (Errno 13). Entries without unix attrs
+        # must not gain an executable bit out of nowhere.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "modes.zip")
+            with zipfile.ZipFile(path, "w") as zf:
+                info = zipfile.ZipInfo("wb-proxy/start-wb-proxy.sh")
+                info.external_attr = 0o755 << 16
+                zf.writestr(info, "#!/bin/sh\n")
+                info = zipfile.ZipInfo("wb-proxy/wb_proxy.py")
+                info.external_attr = 0o644 << 16
+                zf.writestr(info, "x = 1\n")
+                info = zipfile.ZipInfo("wb-proxy/plain.txt")
+                info.external_attr = 0
+                zf.writestr(info, "plain\n")
+            out = os.path.join(d, "out")
+            U.safe_extract(path, out, "wb-proxy")
+            if os.name == "nt":
+                # Windows stores no exec bit (chmod only maps the read-only
+                # bit); extraction succeeding without an error is the contract.
+                self.assertTrue(os.path.isfile(
+                    os.path.join(out, "wb-proxy", "start-wb-proxy.sh")))
+                return
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "start-wb-proxy.sh")).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "wb_proxy.py")).st_mode), 0o644)
+            self.assertFalse(stat.S_IMODE(os.lstat(os.path.join(
+                out, "wb-proxy", "plain.txt")).st_mode) & 0o111)
 
 
 class StageTests(unittest.TestCase):

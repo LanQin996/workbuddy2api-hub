@@ -171,6 +171,13 @@ def safe_extract(zip_path, dest, root_name):
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with zf.open(info) as src, open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
+            # Keep the entry's unix mode: the launch scripts ship 755 and the
+            # post-update restart Popen()s them — a 644 copy dies with EACCES
+            # and rolls the whole update back. Entries without unix attrs keep
+            # the default mode; setuid/sticky bits are never restored.
+            mode = (info.external_attr >> 16) & 0o777
+            if mode:
+                os.chmod(target, mode)
     return dest
 
 

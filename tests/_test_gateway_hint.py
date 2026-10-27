@@ -123,6 +123,7 @@ class ErrorEnvelopeTests(unittest.TestCase):
 class ContextErrorTests(unittest.TestCase):
     def reply(self, route, body, status=400, enabled="1", stream=True):
         stub = _Stub()
+        stub.path = route
         failure = urllib.error.HTTPError("https://up", status, "Bad Request", {},
                                          io.BytesIO(body))
         payload = {"model": "deepseek-v4.1-flash", "stream": stream,
