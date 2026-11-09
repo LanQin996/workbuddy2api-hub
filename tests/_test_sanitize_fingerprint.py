@@ -219,10 +219,16 @@ class DshPathInstructionsTests(unittest.TestCase):
         'inspected it before reading. The @"..." form only quotes a path that '
         "contains spaces."
     )
+    FIRST_SENTENCE = (
+        "Tokens prefixed with @ are paths that the user explicitly referenced."
+    )
     REWRITTEN = (
-        "Paths beginning with @ refer to files the user explicitly mentioned. "
-        "Relative paths are resolved against the workspace root; absolute paths "
-        "point to files or directories on the host. A trailing slash marks a "
+        FIRST_SENTENCE + " " + ORIGINAL.split(". ", 1)[1]
+    )
+    PREVIOUS_PAIR_REWRITE = (
+        "Treat an @-prefixed reference as a path explicitly supplied by the user. "
+        "Interpret relative paths from the workspace root; absolute paths identify "
+        "files or directories on the host. A trailing slash marks a "
         "directory, so list it when its contents matter. Anything else is a file: "
         "open it with the read tool when its contents are needed, and never claim "
         'to have inspected it before reading. The @"..." form only quotes a path '
@@ -232,6 +238,37 @@ class DshPathInstructionsTests(unittest.TestCase):
     def test_rewrites_the_confirmed_opening_sentences(self):
         self.assertEqual(P.sanitize_text(self.ORIGINAL), self.REWRITTEN)
         self.assertFalse(P.has_fingerprint(self.REWRITTEN))
+
+    def test_rewrites_only_the_first_sentence_when_adjacent(self):
+        out = P.sanitize_text(self.ORIGINAL)
+        self.assertTrue(out.startswith(self.FIRST_SENTENCE + " "))
+        self.assertIn("Relative paths resolve from the workspace root", out)
+        self.assertEqual(out, self.REWRITTEN)
+
+    def test_also_rewrites_the_previously_used_wording(self):
+        previous = self.ORIGINAL.replace(
+            "Tokens prefixed with @ are paths the user explicitly referenced. "
+            "Relative paths resolve from",
+            "Paths beginning with @ refer to files the user explicitly mentioned. "
+            "Relative paths are resolved against",
+        )
+        self.assertTrue(P.has_fingerprint(previous))
+        out = P.sanitize_text(previous)
+        self.assertEqual(out, self.PREVIOUS_PAIR_REWRITE)
+        self.assertFalse(P.has_fingerprint(out))
+
+    def test_rewrites_the_reported_resolve_against_variant(self):
+        variant = self.ORIGINAL.replace(
+            "Relative paths resolve from the workspace root",
+            "Relative paths resolve against the workspace root",
+        )
+        self.assertTrue(P.has_fingerprint(variant))
+        out = P.sanitize_text(variant)
+        self.assertEqual(out, self.ORIGINAL.replace(
+            "Tokens prefixed with @ are paths the user explicitly referenced.",
+            self.FIRST_SENTENCE,
+        ).replace("resolve from", "resolve against"))
+        self.assertFalse(P.has_fingerprint(out))
 
     def test_rewrites_when_embedded_in_a_long_system_prompt(self):
         text = "Before the path rules.\n\n" + self.ORIGINAL + "\n\nAfter the rules."
@@ -243,12 +280,12 @@ class DshPathInstructionsTests(unittest.TestCase):
     def test_case_insensitive_and_idempotent(self):
         out = P.sanitize_text(self.ORIGINAL.upper())
         self.assertEqual(P.sanitize_text(out), out)
-        self.assertNotIn("TOKENS PREFIXED WITH @", out)
+        self.assertNotIn("TOKENS PREFIXED WITH @ ARE PATHS THE USER EXPLICITLY REFERENCED", out)
 
     def test_incomplete_or_unrelated_path_text_is_untouched(self):
         for text in (
-            "Tokens prefixed with @ are paths the user explicitly referenced.",
             "Relative paths resolve from the workspace root; absolute paths point to files.",
+            "Tokens prefixed with @ are path references the user explicitly referenced.",
             "Use @ to refer to a path in the workspace.",
         ):
             with self.subTest(text=text):

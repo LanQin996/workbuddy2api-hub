@@ -13382,21 +13382,31 @@ SANITIZE_IDENTITY_RE = re.compile(
     r"[^\n]*?(?:\.(?=\s|$)|(?=\n|$))",
     re.IGNORECASE)
 SANITIZE_IDENTITY_REPLACEMENT = "You are a helpful AI assistant."
-# DSH's @-path instructions are rejected when their opening two sentences match
-# the upstream channel fingerprint. Reword only those sentences; retain the
-# remaining path-handling guidance verbatim.
-SANITIZE_DSH_PATHS_NEEDLE = "Tokens prefixed with @ are paths the user explicitly referenced"
-SANITIZE_DSH_PATHS_LOWER = SANITIZE_DSH_PATHS_NEEDLE.lower()
+# DSH's @-path instructions have shipped with both of these opening variants;
+# upstream rejects the following pair of sentences as a channel fingerprint.
+# Reword only that pair and retain the remaining path-handling guidance verbatim.
+SANITIZE_DSH_PATHS_LOWER = (
+    "tokens prefixed with @ are paths the user explicitly referenced",
+    "paths beginning with @ refer to files the user explicitly mentioned",
+)
+SANITIZE_DSH_PATH_RE = re.compile(
+    r"(Tokens prefixed with @ are paths )(the user explicitly referenced\.)",
+    re.IGNORECASE,
+)
+SANITIZE_DSH_PATH_REPLACEMENT = r"\1that \2"
 SANITIZE_DSH_PATHS_RE = re.compile(
-    r"Tokens prefixed with @ are paths the user explicitly referenced\."
-    r"\s+Relative paths resolve from the workspace root; absolute paths point to "
+    r"(?:Tokens prefixed with @ are paths the user explicitly referenced|"
+    r"Paths beginning with @ refer to files the user explicitly mentioned)\."
+    r"\s+(?:Relative paths resolve (?:from|against)|"
+    r"Relative paths are resolved against) "
+    r"the workspace root; absolute paths point to "
     r"files or directories on the host\.",
     re.IGNORECASE,
 )
 SANITIZE_DSH_PATHS_REPLACEMENT = (
-    "Paths beginning with @ refer to files the user explicitly mentioned. "
-    "Relative paths are resolved against the workspace root; absolute paths point "
-    "to files or directories on the host."
+    "Treat an @-prefixed reference as a path explicitly supplied by the user. "
+    "Interpret relative paths from the workspace root; absolute paths identify "
+    "files or directories on the host."
 )
 # GUI 描述段（#570）：DSH 的系统提示里有一段 GUI 描述，上游按「A 句 + B 句连续出现」
 # 判 11-128。逐段二分实测：指纹是整段，改 A 句、改 B 句、或在两句之间插东西都会失配。
@@ -13474,8 +13484,10 @@ def has_fingerprint(text, identity=True):
         return True
     if not identity:
         return False
-    if (SANITIZE_DSH_PATHS_LOWER in low
-            and SANITIZE_DSH_PATHS_RE.search(text) is not None):
+    if ((SANITIZE_DSH_PATHS_LOWER[0] in low
+         and SANITIZE_DSH_PATH_RE.search(text) is not None)
+            or (SANITIZE_DSH_PATHS_LOWER[1] in low
+                and SANITIZE_DSH_PATHS_RE.search(text) is not None)):
         return True
     # SANITIZE_FEATURES 只登记了首字母大写的 "You are Claude Code"；这里用
     # 小写字面量补齐大小写混排的 system 文本，命中后才走 sanitize_text 的正则。
@@ -13512,7 +13524,10 @@ def sanitize_text(text, identity=True):
     if identity:
         # Apply the upstream one-word rewrite before the legacy paragraph fallback.
         text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
-        if SANITIZE_DSH_PATHS_LOWER in text.lower():
+        if (SANITIZE_DSH_PATHS_LOWER[0] in text.lower()
+                and SANITIZE_DSH_PATH_RE.search(text) is not None):
+            text = SANITIZE_DSH_PATH_RE.sub(SANITIZE_DSH_PATH_REPLACEMENT, text)
+        if any(needle in text.lower() for needle in SANITIZE_DSH_PATHS_LOWER):
             text = SANITIZE_DSH_PATHS_RE.sub(SANITIZE_DSH_PATHS_REPLACEMENT, text)
         # Claude Code 自述首段先整句换掉：它本身就是 SANITIZE_FEATURES 里的指纹。
         text = SANITIZE_CLAUDE_CODE_INTRO_RE.sub(
