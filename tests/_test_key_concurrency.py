@@ -17,6 +17,7 @@ class PostHandler:
 
     def __init__(self, path, key=None, dispatch=None):
         self.path = path
+        self.headers = {}
         self.key_entry = key
         self.dispatch = dispatch or (lambda: "ok")
 
@@ -37,7 +38,7 @@ class PostHandler:
     def _key_id(self):
         return (self.key_entry or {}).get("id")
 
-    def _error(self, code, message, error_type=None):
+    def _error(self, code, message, error_type=None, reset_at=None):
         return code, error_type
 
     _anthropic_error = _error

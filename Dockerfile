@@ -1,3 +1,9 @@
+# Stage 1: Build the local Go/uTLS ClientHello bridge
+FROM golang:1.24-alpine AS tls-bridge
+WORKDIR /src
+COPY tools/wb-tls-bridge/go.mod tools/wb-tls-bridge/go.sum* tools/wb-tls-bridge/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /wb-tls-bridge .
+
 # WorkBuddy Multi-Account Reverse Proxy Gateway
 FROM python:3.11-alpine
 
@@ -9,14 +15,23 @@ WORKDIR /app
 # Alpine timezone & certs
 RUN apk add --no-cache tzdata ca-certificates &&     cp /usr/share/zoneinfo/${TZ} /etc/localtime &&     echo "${TZ}" > /etc/timezone
 
-# Copy application files (Zero external pip dependencies needed)
+# Copy application files. The gateway itself uses only the standard library;
+# PyYAML is installed below solely for the optional subscription bridge.
 COPY wb_*.py dashboard.html ./
+COPY --from=tls-bridge /wb-tls-bridge /app/bin/wb-tls-bridge
+COPY tools/wb-tls-bridge/README.md /app/licenses/wb-tls-bridge/README.md
+COPY tools/wb-tls-bridge/licenses/ /app/licenses/wb-tls-bridge/
+
+# The subscription bridge writes config.yaml for a mihomo instance that must
+# run on the host (or in another container). Persist its data and mount the
+# rendered config into that instance; see docs/SUBBRIDGE.md.
+RUN pip install --no-cache-dir PyYAML==6.0.3
 
 # Create data directories
-RUN mkdir -p /app/accounts /app/usage
+RUN mkdir -p /app/accounts /app/usage /app/subbridge-data
 
 # Volume persistence for credentials and usage logs
-VOLUME ["/app/accounts", "/app/usage"]
+VOLUME ["/app/accounts", "/app/usage", "/app/subbridge-data"]
 
 EXPOSE 8788
 
@@ -33,4 +48,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # No --port on purpose: the gateway already reads PORT from the environment
 # (default 8788), and the exec form cannot expand a variable. Keeping the exec
 # form leaves python as PID 1, so `docker stop` still delivers SIGTERM.
-CMD ["python", "wb_proxy.py", "--host", "0.0.0.0", "--lan"]
+CMD ["python", "-m", "wb_proxy", "--host", "0.0.0.0", "--lan"]

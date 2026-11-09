@@ -11,7 +11,7 @@
  * Run with Node.
  */
 const assert = require('assert');
-const {dashboardScript} = require('./_dashboard_source.js');
+const {dashboardHtml, dashboardScript} = require('./_dashboard_source.js');
 
 const script = dashboardScript();
 
@@ -51,6 +51,14 @@ const SETTINGS = {
   daily_chat_web_attempts_default: 3,
   local_web_tools: true,
   remaining_priority_enabled: true,
+  device_token_status: {
+    source: 'file',
+    configured_file: '/data/device-token',
+    loaded: true,
+    length: 48,
+    cached_at: 1760000000,
+  },
+  desktop_chat_compat: false,
   version: 'v1.6.14',
   accounts_dir: '/data/accounts',
   usage_dir: '/data/usage',
@@ -167,12 +175,29 @@ global.__toasts = toasts;
   assert.equal(element('setRemainingPriority').checked, true,
     '剩余用量优先调度的复选框没写回');
   assert.equal(element('setRemainingPriorityState').textContent, '(已启用)');
+  assert.equal(element('setDeviceTokenFile').value, '/data/device-token',
+    '设备 token 文件路径没写回');
+  assert.equal(element('setDeviceTokenState').textContent,
+    '(已加载 · 48 字符 · 已脱敏)');
+  assert.ok(element('setDeviceTokenMeta').textContent.includes('值已脱敏'),
+    '设备 token 状态应明确标注已脱敏');
+  assert.equal(element('setDesktopChatCompat').checked, false);
+  assert.equal(element('setDesktopChatCompatState').textContent, '(默认关闭)');
   assert.equal(element('setLimitsPerRealm').checked, true, '有分版本覆盖时应勾上');
   assert.equal(element('setWinMaxHeight').value, '640', '窗口限高输入框没写回');
   assert.equal(element('setWinMaxHeightState').textContent, '(当前 640px)',
     '窗口限高状态文案没写回');
 
-  realLog('loadSettings 完整性断言通过（18 项）');
+  /* 6. 标记里每个 id 只能出现一次：`getElementById` 静默取文档顺序上的第一个，
+     重复出来的第二个永远不会被回填，按钮改的也是第一个副本。实测 v1.9.2 设置页有两张
+     一模一样的「上游响应头超时」，下面那张输入框永远空着、点它的保存写的是上面那张的值。
+     先剥掉 <script>：脚本里的模板字符串同样会写 id="…"。 */
+  const markup = dashboardHtml().replace(/<script[\s\S]*?<\/script>/g, '');
+  const ids = [...markup.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
+  const dup = [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))];
+  assert.deepStrictEqual(dup, [], '页面里有重复的元素 id：' + dup.join(', '));
+
+  realLog('loadSettings 完整性断言通过（19 项）');
 })().catch(e => {
   console.log = realLog;
   console.error(e && e.stack || e);
